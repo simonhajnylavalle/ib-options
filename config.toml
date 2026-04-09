@@ -1,0 +1,128 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# config.toml — Single source of truth for every tunable parameter.
+#
+# To change a parameter: edit the value below and restart.
+# Any value omitted here falls back to the default in strategy.py.
+# ─────────────────────────────────────────────────────────────────────────────
+
+[general]
+loop_interval        = 300      # seconds between strategy ticks
+risk_ceiling         = 0.40     # max options notional / NAV
+approach_max_nav_pct = 0.03     # hard cap for APPROACH sizing
+sentinel_max_nav_pct = 0.03     # hard cap for SENTINEL sizing
+sniper_max_nav_pct   = 0.40     # hard cap for SNIPER sizing (% of NAV)
+base_currency        = "CHF"    # account base currency for IB value fetching
+account_id           = ""       # optional IB account code; blank = auto-select
+
+
+# ── EXECUTION ─────────────────────────────────────────────────────────────────
+# Retry and pricing behaviour for order placement.
+#
+# Two profiles: "patient" (entries, profit-taking, DTE floor, max hold)
+#               "urgent"  (stop loss, trailing stop)
+#
+# Mode ladder: start at `mode`, switch to `fallback_mode` after
+# `fallback_after` attempts, optionally use `last_resort_mode` on the
+# final attempt only (set to "" to disable).
+
+[execution.patient]
+fill_timeout_secs = 60        # seconds per attempt
+max_retries       = 29        # total attempts = 30  (~30 min)
+mode              = "IB_MODEL"
+fallback_mode     = "MID"
+fallback_after    = 10        # first 10 attempts IB_MODEL, rest MID
+last_resort_mode  = ""        # no NATURAL ever
+
+[execution.urgent]
+fill_timeout_secs = 60        # seconds per attempt
+max_retries       = 7         # total attempts = 8   (~8 min)
+mode              = "IB_MODEL"
+fallback_mode     = "MID"
+fallback_after    = 3         # first 3 attempts IB_MODEL, rest MID
+last_resort_mode  = "NATURAL" # NATURAL on final attempt only (stop loss)
+
+
+# ── THESIS ──────────────────────────────────────────────────────────────────
+
+[thesis.exit]
+stop_loss_pct      = -0.45
+full_exit_pct      =  1.50
+trailing_stop_pct  =  0.30
+dte_floor          =  5
+tranches           = [[0.50, 0.25], [1.00, 0.35]]
+# velocity spike
+spike_pct          =  1.00
+spike_window_hours =  6.0
+spike_sell_ratio   =  0.50
+
+[thesis.contract]
+delta_min    = 0.40
+delta_max    = 0.55
+dte_min      = 25
+dte_max      = 50
+strike_width = 0.25
+
+
+# ── APPROACH ────────────────────────────────────────────────────────────────
+
+[approach.exit]
+stop_loss_pct      = -0.35
+full_exit_pct      =  0.60
+trailing_stop_pct  =  0.20
+dte_floor          =  8
+tranches           = [[0.15, 0.30], [0.30, 0.40]]
+# velocity spike
+spike_pct          =  0.80
+spike_window_hours =  4.0
+spike_sell_ratio   =  0.60
+
+[approach.contract]
+delta_min    = 0.30
+delta_max    = 0.45
+dte_min      = 25
+dte_max      = 45
+strike_width = 0.20
+
+
+# ── SENTINEL ────────────────────────────────────────────────────────────────
+
+[sentinel.exit]
+stop_loss_pct      = -0.50
+full_exit_pct      =  1.00
+trailing_stop_pct  =  0.25
+dte_floor          =  15
+tranches           = [[0.30, 0.30], [0.60, 0.40]]
+# velocity spike
+spike_pct          =  1.00
+spike_window_hours =  6.0
+spike_sell_ratio   =  0.50
+
+[sentinel.contract]
+delta_min         = 0.15
+delta_max         = 0.30
+dte_min           = 60
+dte_max           = 120
+strike_width      = 0.30
+max_spread_pct    = 25.0      # relaxed for illiquid biotech
+min_open_interest = 10
+min_volume        = 1
+
+
+# ── SNIPER ──────────────────────────────────────────────────────────────────
+
+[sniper.exit]
+stop_loss_pct = -0.50
+full_exit_pct =  1.00
+max_hold_days =  7
+dte_floor     =  1
+
+[sniper.contract]
+delta_min    = 0.35
+delta_max    = 0.55
+dte_min      = 2
+dte_max      = 14
+strike_width = 0.20
+
+[sniper.scanner]
+watchlist = ["BNTX", "NVAX", "MRNA", "REGN"]
+drop_pct  = 0.15
