@@ -857,7 +857,7 @@ class Executor:
 # ─────────────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    from ib_core import OptionChain, Account, connect, Right
+    from broker import OptionChain, Account, connect, Right
 
     ib = connect()
     ex = Executor(ib)

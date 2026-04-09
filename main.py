@@ -22,7 +22,7 @@ from rich.table import Table
 
 import config
 import state
-from ib_core   import OptionChain, Right, connect
+from broker import OptionChain, Right, connect
 from portfolio import CashPolicy
 from strategy  import (
     ConvictionLevel, PlayStatus, PlayType,

@@ -429,7 +429,7 @@ class OptionChain:
 class AccountSnapshot:
     """
     Point-in-time account view. All monetary values in USD.
-    This is the only object portfolio.py ever receives from ib_core —
+    This is the only object portfolio.py ever receives from broker —
     the clean boundary between data-fetching and risk-measurement.
 
     account_id     — selected IB account for this snapshot

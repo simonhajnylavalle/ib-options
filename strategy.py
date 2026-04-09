@@ -47,7 +47,7 @@ from zoneinfo import ZoneInfo
 import pandas as pd
 import state
 
-from ib_core import IB, Account, AccountSnapshot, OptionChain, Right, Stock, connect
+from broker import IB, Account, AccountSnapshot, OptionChain, Right, Stock, connect
 from portfolio import CashPolicy, PortfolioRisk
 from execution import Executor, OrderResult, OrderSide, PriceMode, RetryProfile
 

@@ -25,7 +25,7 @@ Risk ceiling enforcement:
 from __future__ import annotations
 from dataclasses import dataclass
 import pandas as pd
-from ib_core import Account, AccountSnapshot, connect
+from broker import Account, AccountSnapshot, connect
 
 
 # ─────────────────────────────────────────────────────────────────────────────
