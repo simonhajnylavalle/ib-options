@@ -1,0 +1,17 @@
+# Versions used for the current local validation run.
+# Install with: python -m pip install -c requirements.lock -e ".[test]"
+eventkit==1.0.3
+ib-insync==0.9.86
+iniconfig==2.3.0
+markdown-it-py==4.0.0
+mdurl==0.1.2
+nest_asyncio==1.6.0
+numpy==2.4.4
+packaging==25.0
+pandas==3.0.2
+pluggy==1.5.0
+Pygments==2.19.2
+pytest==9.0.3
+python-dateutil==2.9.0.post0
+rich==14.2.0
+six==1.17.0

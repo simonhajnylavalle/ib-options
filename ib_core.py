@@ -372,6 +372,7 @@ class Account:
         "UnrealizedPnL": "unrealized_pnl",
         "RealizedPnL": "realized_pnl",
     }
+    _REQUIRED_VALUE_FIELDS = ("nav", "cash", "buying_power")
 
     def __init__(
         self,
@@ -384,7 +385,7 @@ class Account:
         self.account_id = self._resolve_account_id(account_id)
 
     def snapshot(self) -> AccountSnapshot:
-        values = self._account_values()
+        values, currency = self._account_values()
         positions = self._positions()
         return AccountSnapshot(
             account_id=self.account_id,
@@ -394,7 +395,7 @@ class Account:
             unrealized_pnl=values.get("unrealized_pnl", 0.0),
             realized_pnl=values.get("realized_pnl", 0.0),
             positions=positions,
-            currency=self._base_currency,
+            currency=currency,
         )
 
     def print_snapshot(self) -> None:
@@ -438,14 +439,26 @@ class Account:
             "or verify the IB connection before placing routed orders."
         )
 
-    def _account_values(self) -> dict:
+    def _currency_priority(self) -> list[str]:
+        out = []
+        for currency in ("BASE", self._base_currency.upper(), "USD"):
+            if currency and currency not in out:
+                out.append(currency)
+        return out
+
+    def _display_currency(self, currency: str) -> str:
+        return self._base_currency if currency == "BASE" else currency
+
+    def _account_values(self) -> tuple[dict, str]:
         """
-        Read account summary values, preferring IB's BASE currency rows and
-        falling back to the configured base currency.
+        Read account summary values from the most complete IB currency bucket.
+
+        Swiss accounts often expose useful account-summary fields as USD even
+        when the account base is CHF. Prefer complete BASE/configured-currency
+        rows, but fall back to USD before returning empty values.
         """
 
-        base_results: dict[str, float] = {}
-        fallback_results: dict[str, float] = {}
+        by_currency: dict[str, dict[str, float]] = {}
         for item in self.ib.accountSummary(self.account_id or ""):
             field = self._TAG_MAP.get(item.tag)
             if not field:
@@ -454,11 +467,29 @@ class Account:
                 value = float(item.value)
             except ValueError:
                 continue
-            if item.currency == "BASE":
-                base_results[field] = value
-            elif item.currency == self._base_currency:
-                fallback_results[field] = value
-        return {**fallback_results, **base_results}
+            currency = str(getattr(item, "currency", "") or "").upper()
+            if not currency:
+                continue
+            by_currency.setdefault(currency, {})[field] = value
+
+        if not by_currency:
+            return {}, self._base_currency
+
+        priority = self._currency_priority()
+
+        def score(entry: tuple[str, dict[str, float]]) -> tuple[int, int, int, int]:
+            currency, values = entry
+            priority_idx = priority.index(currency) if currency in priority else len(priority)
+            required_count = sum(1 for field in self._REQUIRED_VALUE_FIELDS if field in values)
+            return (
+                1 if "nav" in values else 0,
+                required_count,
+                len(values),
+                -priority_idx,
+            )
+
+        currency, values = max(by_currency.items(), key=score)
+        return values, self._display_currency(currency)
 
     def _positions(self) -> pd.DataFrame:
         rows = []

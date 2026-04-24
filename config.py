@@ -162,7 +162,7 @@ risk_ceiling         = 0.40     # max options notional / NAV
 approach_max_nav_pct = 0.03     # hard cap for APPROACH sizing
 sentinel_max_nav_pct = 0.03     # hard cap for SENTINEL sizing
 sniper_max_nav_pct   = 0.40     # hard cap for SNIPER sizing (% of NAV)
-base_currency        = "CHF"    # account base currency for IB value fetching
+base_currency        = "CHF"    # preferred IB account-summary currency; BASE/USD fallback is automatic
 account_id           = ""       # optional IB account code; blank = auto-select
 ib_host              = "127.0.0.1"
 ib_port              = 4001

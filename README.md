@@ -23,6 +23,12 @@ Interactive Brokers options trading console with a stateful strategy loop, NAV-b
 python -m pip install -e ".[test]"
 ```
 
+For a repeatable install using the versions validated in this repo:
+
+```bash
+python -m pip install -c requirements.lock -e ".[test]"
+```
+
 Installed wheel/venv usage also exposes:
 
 ```bash
@@ -58,6 +64,14 @@ option-algorithm
 
 The app connects to IB using the host/port/client ID configured in `config.toml`, resolves the managed account, routes outbound orders to that account, loads any persisted plays, rebinds pending live entry/exit orders, runs an immediate strategy tick, and then continues on the configured loop interval.
 
+## Live Smoke Check
+
+```bash
+option-algorithm-smoke
+```
+
+This is read-only: it connects to the configured live IB endpoint, resolves the account, reads account summary, positions, and open orders, then disconnects without submitting orders.
+
 ## Test
 
 ```bash
@@ -72,13 +86,14 @@ The test suite is broker-independent. It covers:
 - play evaluation when positions vanish from the account
 - startup rebinding or safe blocking of pending exits
 - manual scale-out reservation logic that prevents double-sells
-- long-call-only guards, pending-entry handling, and currency mismatch blocking
+- long-call-only guards, pending-entry handling, and Swiss-account USD summary fallback
+- read-only live smoke command packaging
 
 ## Current Limits
 
 - Live trading still requires IB Gateway or TWS.
 - The strategy is intentionally long-CALL-only for now. PUT and short-option tracking are rejected.
-- Entry sizing refuses to run when the account snapshot currency and option order currency differ; add FX conversion before trading a non-USD base account against USD options.
+- Account summary values prefer IB `BASE` / configured currency rows but fall back to USD when IB only returns usable USD data for a Swiss account.
 - Unbound or exhausted pending orders are kept blocked until the operator verifies them, rather than auto-clearing and risking duplicate orders.
-- There is no end-to-end integration harness in this repository.
+- The live smoke check is read-only; this repository intentionally does not automate live order placement as a test.
 - `plays.json` is local process state, not a shared or durable order journal.

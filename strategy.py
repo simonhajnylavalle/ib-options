@@ -630,15 +630,6 @@ class Strategy:
                 "blocking new entries until portfolio values are reliable."
             )
             return False
-        account_currency = str(getattr(ctx.snapshot, "currency", "") or "").upper()
-        order_currency = str(contract_currency or self.executor.currency or "").upper()
-        if account_currency and order_currency and account_currency != order_currency:
-            print(
-                f"[STRATEGY] Currency mismatch: account values are {account_currency}, "
-                f"option orders are priced in {order_currency}. "
-                "Refusing to size entries without FX conversion."
-            )
-            return False
         return True
 
     @staticmethod

@@ -22,12 +22,14 @@ test = [
 
 [project.scripts]
 option-algorithm = "main:main"
+option-algorithm-smoke = "live_smoke:main"
 
 [tool.setuptools]
 py-modules = [
   "config",
   "execution",
   "ib_core",
+  "live_smoke",
   "main",
   "paths",
   "portfolio",

@@ -603,7 +603,61 @@ def test_unbound_working_exit_blocks_resubmit(monkeypatch):
     assert strat.executor.submit_calls == 0
 
 
-def test_currency_mismatch_blocks_entry_guard(monkeypatch):
+def test_account_snapshot_uses_usd_summary_when_chf_rows_are_missing():
+    import ib_core
+
+    class FakeIB:
+        def managedAccounts(self):
+            return ["ACC"]
+
+        def accountSummary(self, account):
+            assert account == "ACC"
+            return [
+                SimpleNamespace(tag="NetLiquidation", value="10000", currency="USD"),
+                SimpleNamespace(tag="TotalCashValue", value="7500", currency="USD"),
+                SimpleNamespace(tag="BuyingPower", value="30000", currency="USD"),
+                SimpleNamespace(tag="UnrealizedPnL", value="12.5", currency="USD"),
+                SimpleNamespace(tag="RealizedPnL", value="4.5", currency="USD"),
+            ]
+
+        def positions(self, account):
+            return []
+
+    snapshot = ib_core.Account(FakeIB(), base_currency="CHF").snapshot()
+
+    assert snapshot.currency == "USD"
+    assert snapshot.nav == 10_000.0
+    assert snapshot.cash == 7_500.0
+    assert snapshot.buying_power == 30_000.0
+
+
+def test_account_snapshot_prefers_complete_summary_over_configured_partial_rows():
+    import ib_core
+
+    class FakeIB:
+        def managedAccounts(self):
+            return ["ACC"]
+
+        def accountSummary(self, account):
+            return [
+                SimpleNamespace(tag="NetLiquidation", value="9000", currency="CHF"),
+                SimpleNamespace(tag="NetLiquidation", value="10000", currency="USD"),
+                SimpleNamespace(tag="TotalCashValue", value="7500", currency="USD"),
+                SimpleNamespace(tag="BuyingPower", value="30000", currency="USD"),
+            ]
+
+        def positions(self, account):
+            return []
+
+    snapshot = ib_core.Account(FakeIB(), base_currency="CHF").snapshot()
+
+    assert snapshot.currency == "USD"
+    assert snapshot.nav == 10_000.0
+    assert snapshot.cash == 7_500.0
+    assert snapshot.buying_power == 30_000.0
+
+
+def test_currency_mismatch_does_not_block_entry_guard(monkeypatch):
     import ib_core
     import portfolio
     import strategy
@@ -635,7 +689,7 @@ def test_currency_mismatch_blocks_entry_guard(monkeypatch):
     monkeypatch.setattr(strategy, "Executor", DummyExecutor)
 
     strat = strategy.Strategy(ib=object(), policy=portfolio.CashPolicy(), base_currency="CHF")
-    assert strat._entry_guard(strat.context(snapshot), "USD") is False
+    assert strat._entry_guard(strat.context(snapshot), "USD") is True
 
 
 def test_empty_startup_positions_does_not_close_active_play():

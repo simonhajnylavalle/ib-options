@@ -12,6 +12,7 @@ Console input is read from a daemon thread; commands dispatch on main.
 from __future__ import annotations
 
 import queue
+import sys
 import threading
 import time
 from dataclasses import replace
@@ -978,11 +979,16 @@ def main():
 
     stop = threading.Event()
     q: queue.Queue[str] = queue.Queue()
-    threading.Thread(
-        target=_read_console, args=(q, stop), daemon=True, name="console",
-    ).start()
+    console_enabled = sys.stdin.isatty()
+    if console_enabled:
+        threading.Thread(
+            target=_read_console, args=(q, stop), daemon=True, name="console",
+        ).start()
+    else:
+        print("[console] stdin is not interactive; command console disabled.")
 
-    print(f"\nReady  (loop every {CFG.loop_interval}s).  Type 'help' for commands.\n")
+    hint = "Type 'help' for commands." if console_enabled else "Running headless."
+    print(f"\nReady  (loop every {CFG.loop_interval}s).  {hint}\n")
 
     try:
         strat.step()
