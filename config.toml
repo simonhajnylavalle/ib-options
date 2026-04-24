@@ -1,8 +1,12 @@
 # ─────────────────────────────────────────────────────────────────────────────
-# config.toml — Single source of truth for every tunable parameter.
+# config.toml — Single source of truth for every tunable runtime parameter.
 #
-# To change a parameter: edit the value below and restart.
-# Any value omitted here falls back to the default in strategy.py.
+# Runtime config search order:
+#   1. OPTION_ALGORITHM_CONFIG
+#   2. ./config.toml
+#   3. ~/.config/option_algorithm/config.toml
+#
+# If a value or section is omitted, config.py fills it from built-in defaults.
 # ─────────────────────────────────────────────────────────────────────────────
 
 [general]
@@ -13,6 +17,9 @@ sentinel_max_nav_pct = 0.03     # hard cap for SENTINEL sizing
 sniper_max_nav_pct   = 0.40     # hard cap for SNIPER sizing (% of NAV)
 base_currency        = "CHF"    # account base currency for IB value fetching
 account_id           = ""       # optional IB account code; blank = auto-select
+ib_host              = "127.0.0.1"
+ib_port              = 4001
+ib_client_id         = 1
 
 
 # ── EXECUTION ─────────────────────────────────────────────────────────────────
@@ -23,7 +30,8 @@ account_id           = ""       # optional IB account code; blank = auto-select
 #
 # Mode ladder: start at `mode`, switch to `fallback_mode` after
 # `fallback_after` attempts, optionally use `last_resort_mode` on the
-# final attempt only (set to "" to disable).
+# final attempt only (set to "" to disable). Set fallback_mode="" to disable
+# fallback-mode switching entirely.
 
 [execution.patient]
 fill_timeout_secs = 60        # seconds per attempt

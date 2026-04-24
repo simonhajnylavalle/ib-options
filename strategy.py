@@ -31,8 +31,8 @@ after max_hold_days.  No tranches, no spike.
 CONFIGURATION
 ─────────────────────────────────────────────────────────────────────────────
 
-All tunable parameters live in main.py's StrategyConfig.  ExitProfile
-defaults accept **kw so any field can be overridden from config.
+All tunable parameters are loaded by config.py from config.toml
+(or built-in defaults when no file exists).
 """
 
 from __future__ import annotations
@@ -92,8 +92,8 @@ class PlayStatus(str, Enum):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# SIZING DEFAULTS  (single source of truth — config.py falls back to these
-# via config.toml; do NOT duplicate elsewhere)
+# SIZING DEFAULTS  (used when Strategy is instantiated directly without the
+# config loader)
 # ─────────────────────────────────────────────────────────────────────────────
 
 _DEFAULT_APPROACH_MAX_NAV_PCT: float = 0.03
@@ -181,16 +181,60 @@ class ExitProfile:
 
 
 @dataclass
-class WorkingOrder:
-    """Session-only async order state so exits do not block the strategy loop."""
-    trade_result:   OrderResult
-    remaining_qty:  int
-    attempts_used:  int
-    submitted_at:   datetime
-    retry_kind:     str
-    reason:         str
+class WorkingEntry:
+    """
+    Async entry state for a buy order that may still be live after a blocking
+    retry cycle returns.  Kept separate from qty_open: qty_open is only live
+    IB position, while this object represents possible future fills.
+    """
+    trade_result: Optional[OrderResult]
+    requested_qty: int
+    remaining_qty: int
+    attempts_used: int
+    submitted_at: datetime
+    retry_kind: str = "patient"
+    reason: str = "entry"
+    status: str = "WORKING"  # WORKING, UNBOUND, EXHAUSTED
     accounted_fills: int = 0
     cancel_requested: bool = False
+    order_id: Optional[int] = None
+    perm_id: Optional[int] = None
+    native_order_id: Optional[int] = None
+    client_id: Optional[int] = None
+    account_id: Optional[str] = None
+    side: str = "BUY"
+    limit_px: Optional[float] = None
+    submitted_qty: Optional[int] = None
+
+
+@dataclass
+class WorkingOrder:
+    """
+    Async exit state.
+
+    trade_result is None after a restart until Strategy.restore_working_orders()
+    rebinds this metadata to a live broker order.  UNBOUND/EXHAUSTED states
+    deliberately keep the play blocked to avoid duplicate SELL-to-close orders.
+    """
+    trade_result: Optional[OrderResult]
+    remaining_qty: int
+    attempts_used: int
+    submitted_at: datetime
+    retry_kind: str
+    reason: str
+    status: str = "WORKING"  # WORKING, UNBOUND, EXHAUSTED
+    order_id: Optional[int] = None
+    perm_id: Optional[int] = None
+    native_order_id: Optional[int] = None
+    client_id: Optional[int] = None
+    account_id: Optional[str] = None
+    side: str = "SELL"
+    limit_px: Optional[float] = None
+    submitted_qty: Optional[int] = None
+    accounted_fills: int = 0
+    cancel_requested: bool = False
+    reserved_tranche_idx: Optional[int] = None
+    reserve_spike_fired: bool = False
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -229,10 +273,11 @@ class Play:
     tranche_idx:  int        = 0
     spike_fired:  bool       = False
 
-    # Session-only: not serialized to plays.json (contains live Trade refs).
-    # After a restart this list is always empty.
+    # Session-only order history. working_order metadata *is* serialized, but
+    # its live Trade ref is rebound from IB on startup/reconnect.
     orders: list[OrderResult] = field(default_factory=list)
     working_order: Optional[WorkingOrder] = None
+    working_entry: Optional[WorkingEntry] = None
 
     def current_pnl_pct(self, current_price: float) -> float:
         return (current_price - self.entry_price) / self.entry_price
@@ -295,7 +340,7 @@ class Play:
         # Require minimum data density to avoid false spikes.
         if in_window_count < 3:
             return None
-        last_time = self.pnl_history[-1][0]
+        last_time = _as_market_dt(self.pnl_history[-1][0])
         span_minutes = (last_time - first_in_window_time).total_seconds() / 60
         if span_minutes < 15:
             return None
@@ -303,6 +348,7 @@ class Play:
         if before is not None:
             t0, p0 = before
             t1, p1 = self.pnl_history[first_in_idx]
+            t1 = _as_market_dt(t1)
             dt = t1.timestamp() - t0.timestamp()
             if dt > 0:
                 frac = (cutoff - t0.timestamp()) / dt
@@ -408,14 +454,29 @@ class SniperScanner:
             return (symbol, last)
         avg_vol = self._average_daily_volume(stock, days=20)
         if avg_vol and avg_vol > 0:
-            if today_vol < avg_vol * self.min_volume_ratio:
+            session_progress = self._session_progress()
+            # Compare against the portion of average daily volume that would be
+            # reasonable *so far* in the regular session, with a small floor so
+            # the scanner still demands meaningful participation near the open.
+            required_vol = avg_vol * self.min_volume_ratio * max(0.10, session_progress)
+            if today_vol < required_vol:
                 print(
                     f"[SCANNER] {symbol}: drop={drop:.1%} but "
                     f"volume too light ({today_vol:,} vs "
-                    f"{avg_vol * self.min_volume_ratio:,.0f})"
+                    f"{required_vol:,.0f} required so far)"
                 )
                 return None
         return (symbol, last)
+
+    def _session_progress(self, now: Optional[datetime] = None) -> float:
+        now = _as_market_dt(now or _market_now())
+        start = now.replace(hour=9, minute=30, second=0, microsecond=0)
+        end   = now.replace(hour=16, minute=0, second=0, microsecond=0)
+        if now <= start:
+            return 0.0
+        if now >= end:
+            return 1.0
+        return (now - start).total_seconds() / (end - start).total_seconds()
 
     def _average_daily_volume(self, stock, days: int = 20) -> Optional[float]:
         cache_key = (stock.symbol, _market_date())
@@ -483,11 +544,14 @@ class Strategy:
     ):
         self.ib                   = ib
         self.policy               = policy
-        self.executor             = Executor(ib)
         self.account              = Account(
             ib,
             base_currency=base_currency,
             account_id=account_id,
+        )
+        self.executor             = Executor(
+            ib,
+            account_id=self.account.account_id,
         )
         self.exit_profiles        = exit_profiles or {}
         self.contract_specs       = contract_specs or {}
@@ -546,6 +610,92 @@ class Strategy:
             ctx.contract_cache[con_id] = contract
         return contract
 
+    def _entry_budget(self, ctx: StrategyContext, desired_capital: float) -> float:
+        if desired_capital <= 0:
+            return 0.0
+        caps = [desired_capital, ctx.risk.headroom()]
+        if ctx.snapshot.cash > 0:
+            caps.append(ctx.snapshot.cash)
+        if ctx.snapshot.buying_power > 0:
+            caps.append(ctx.snapshot.buying_power)
+        return min(caps) if caps else 0.0
+
+    def _entry_guard(self, ctx: StrategyContext, contract_currency: Optional[str] = None) -> bool:
+        """Fail-closed preflight for new option entries."""
+        if not self._risk_guard(ctx.risk):
+            return False
+        if self._option_market_values_missing(ctx.snapshot.positions):
+            print(
+                "[STRATEGY] Option position market values are missing from IB; "
+                "blocking new entries until portfolio values are reliable."
+            )
+            return False
+        account_currency = str(getattr(ctx.snapshot, "currency", "") or "").upper()
+        order_currency = str(contract_currency or self.executor.currency or "").upper()
+        if account_currency and order_currency and account_currency != order_currency:
+            print(
+                f"[STRATEGY] Currency mismatch: account values are {account_currency}, "
+                f"option orders are priced in {order_currency}. "
+                "Refusing to size entries without FX conversion."
+            )
+            return False
+        return True
+
+    @staticmethod
+    def _option_market_values_missing(positions: pd.DataFrame) -> bool:
+        if positions is None or positions.empty or "sec_type" not in positions.columns:
+            return False
+        opt_rows = positions[positions["sec_type"] == "OPT"]
+        if opt_rows.empty:
+            return False
+        for _, row in opt_rows.iterrows():
+            qty = abs(float(row.get("position", 0) or 0))
+            if qty <= 0:
+                continue
+            mv = row.get("market_value")
+            if mv is None or pd.isna(mv):
+                return True
+        return False
+
+    @staticmethod
+    def _row_is_call(row) -> bool:
+        return str(row.get("right", "")).upper() == Right.CALL.value
+
+    def _contract_is_call(self, contract) -> bool:
+        return str(getattr(contract, "right", "")).upper() == Right.CALL.value
+
+    def _reject_non_call_row(self, row, symbol: str, source: str) -> bool:
+        if self._row_is_call(row):
+            return False
+        print(f"[STRATEGY] {source} {symbol.upper()}: only CALL options are supported for now")
+        return True
+
+    def _soft_contract_warnings(self, row, spec: ContractSpec) -> list[str]:
+        """Make soft filter violations visible without rejecting the contract."""
+        warnings: list[str] = []
+        delta = row.get("delta")
+        if delta is not None and delta == delta:
+            abs_delta = abs(float(delta))
+            if spec.delta_min is not None and abs_delta < spec.delta_min:
+                warnings.append(f"delta {abs_delta:.2f} below target {spec.delta_min:.2f}")
+            if spec.delta_max is not None and abs_delta > spec.delta_max:
+                warnings.append(f"delta {abs_delta:.2f} above target {spec.delta_max:.2f}")
+        spread_pct = row.get("spread_pct")
+        if spread_pct is not None and spread_pct == spread_pct and spread_pct > spec.max_spread_pct:
+            warnings.append(f"spread {float(spread_pct):.1f}% above target {spec.max_spread_pct:.1f}%")
+        volume = row.get("volume")
+        if volume is not None and volume == volume and float(volume) < spec.min_volume:
+            warnings.append(f"volume {float(volume):.0f} below target {spec.min_volume}")
+        oi = row.get("open_interest")
+        if oi is not None and oi == oi and float(oi) < spec.min_open_interest:
+            warnings.append(f"open interest {float(oi):.0f} below target {spec.min_open_interest}")
+        return warnings
+
+    def _print_soft_contract_warnings(self, row, spec: ContractSpec, symbol: str) -> None:
+        warnings = self._soft_contract_warnings(row, spec)
+        if warnings:
+            print(f"[STRATEGY] {symbol.upper()} selected least-bad contract: " + "; ".join(warnings))
+
     # ── entry methods ─────────────────────────────────────────────────────────
 
     def open_thesis(
@@ -554,6 +704,9 @@ class Strategy:
         spec: Optional[ContractSpec] = None,
         exit_profile: Optional[ExitProfile] = None,
     ) -> Optional[Play]:
+        if right is not Right.CALL:
+            print("[STRATEGY] THESIS: only CALL options are supported for now")
+            return None
         spec = replace(spec or self._contract_spec(PlayType.THESIS), right=right)
         return self._open_directional(
             play_type    = PlayType.THESIS,
@@ -569,8 +722,12 @@ class Strategy:
         spec: Optional[ContractSpec] = None,
         exit_profile: Optional[ExitProfile] = None,
     ) -> Optional[Play]:
-        def _size(risk, nav, ask):
-            max_usd = min(nav * max_nav_pct, risk.headroom())
+        if right is not Right.CALL:
+            print(f"[STRATEGY] {play_type.value}: only CALL options are supported for now")
+            return None
+        def _size(ctx: StrategyContext, ask: float) -> int:
+            desired = min(ctx.snapshot.nav * max_nav_pct, ctx.risk.headroom())
+            max_usd = self._entry_budget(ctx, desired)
             return int(max_usd / (ask * 100)) if (max_usd > 0 and ask > 0) else 0
         spec = replace(spec or self._contract_spec(play_type), right=right)
         return self._open_entry(
@@ -606,8 +763,6 @@ class Strategy:
         ctx: Optional[StrategyContext] = None,
     ) -> Optional[Play]:
         ctx = ctx or self.context()
-        if not self._risk_guard(ctx.risk):
-            return None
         spec  = spec or self._contract_spec(PlayType.SNIPER)
         chain = OptionChain(self.ib, symbol)
         picks = chain.select(spot_price=spot_price, **spec.to_kwargs())
@@ -615,13 +770,18 @@ class Strategy:
             print(f"[STRATEGY] SNIPER {symbol}: no qualifying contract")
             return None
         row = picks.iloc[0]
+        if self._reject_non_call_row(row, symbol, "SNIPER"):
+            return None
+        contract_currency = str(row.get("currency", self.executor.currency) or self.executor.currency)
+        if not self._entry_guard(ctx, contract_currency):
+            return None
+        self._print_soft_contract_warnings(row, spec, symbol)
         con_id = int(row["con_id"])
         if self._reject_duplicate_contract(con_id, symbol):
             return None
         ask = float(row["ask"])
-        # Cap sniper sizing by sniper_max_nav_pct (analogous to approach/sentinel)
-        # instead of using 100% of headroom unconditionally.
-        max_usd = min(ctx.snapshot.nav * self.sniper_max_nav_pct, ctx.risk.headroom())
+        desired = ctx.snapshot.nav * self.sniper_max_nav_pct
+        max_usd = self._entry_budget(ctx, desired)
         qty = int(max_usd / (ask * 100)) if (max_usd > 0 and ask > 0) else 0
         if qty < 1:
             print(f"[STRATEGY] SNIPER {symbol}: insufficient headroom")
@@ -647,14 +807,17 @@ class Strategy:
         ctx: Optional[StrategyContext] = None,
     ) -> Optional[Play]:
         ctx = ctx or self.context()
-        if not self._risk_guard(ctx.risk):
-            return None
         if qty < 1:
             print("[STRATEGY] manual entry qty must be at least 1")
             return None
         profile  = exit_profile or self._exit_profile(play_type)
         contract = self._resolve_contract(con_id, ctx)
         sym      = symbol.upper() or contract.symbol
+        if not self._contract_is_call(contract):
+            print(f"[STRATEGY] manual {sym}: only CALL options are supported for now")
+            return None
+        if not self._entry_guard(ctx, getattr(contract, "currency", self.executor.currency)):
+            return None
         if self._reject_duplicate_contract(con_id, sym):
             return None
         bid, ask, last = self._quote_option_contract(contract)
@@ -666,17 +829,21 @@ class Strategy:
         if ref_px <= 0:
             print(f"[STRATEGY] manual {sym}: no valid price (market data unavailable)")
             return None
-        if play_type in (PlayType.APPROACH, PlayType.SENTINEL):
-            cap = (self.approach_max_nav_pct if play_type is PlayType.APPROACH
-                   else self.sentinel_max_nav_pct)
-            max_usd  = min(ctx.snapshot.nav * cap, ctx.risk.headroom())
+        if play_type in (PlayType.APPROACH, PlayType.SENTINEL, PlayType.SNIPER):
+            cap = {
+                PlayType.APPROACH: self.approach_max_nav_pct,
+                PlayType.SENTINEL: self.sentinel_max_nav_pct,
+                PlayType.SNIPER: self.sniper_max_nav_pct,
+            }[play_type]
+            max_usd = self._entry_budget(ctx, ctx.snapshot.nav * cap)
             qty_algo = int(max_usd / (ref_px * 100)) if (max_usd > 0 and ref_px > 0) else 0
-            qty_use  = min(qty, qty_algo)
+            qty_use = min(qty, qty_algo)
         else:
-            conv    = conviction or ConvictionLevel.MEDIUM
-            max_usd = ctx.risk.headroom() * conv.value
+            conv = conviction or ConvictionLevel.MEDIUM
+            desired = ctx.risk.headroom() * conv.value
+            max_usd = self._entry_budget(ctx, desired)
             qty_algo = int(max_usd / (ref_px * 100)) if (max_usd > 0 and ref_px > 0) else 0
-            qty_use  = min(qty, qty_algo)
+            qty_use = min(qty, qty_algo)
         if qty_use < 1:
             print(f"[STRATEGY] manual {sym}: insufficient headroom")
             return None
@@ -703,9 +870,19 @@ class Strategy:
         if str(pos_row.get("sec_type", "")).upper() != "OPT":
             print(f"[STRATEGY] track {con_id}: only option positions can become plays")
             return None
+        if str(pos_row.get("right", "")).upper() != Right.CALL.value:
+            print(f"[STRATEGY] track {con_id}: only CALL option positions are supported for now")
+            return None
+        raw_qty = float(pos_row.get("position", 0) or 0)
+        if raw_qty < 0:
+            print(
+                f"[STRATEGY] track {con_id}: short option positions are not supported; "
+                "automatic exits are SELL-to-close only."
+            )
+            return None
         if self._reject_duplicate_contract(con_id, symbol or str(pos_row.get('symbol', ''))):
             return None
-        live_qty = int(abs(float(pos_row.get("position", 0) or 0)))
+        live_qty = int(raw_qty)
         if live_qty < 1:
             print(f"[STRATEGY] track {con_id}: live quantity is zero")
             return None
@@ -752,7 +929,7 @@ class Strategy:
             if hit:
                 sym, spot = hit
                 if not self._has_open_play(sym, PlayType.SNIPER):
-                    self.open_sniper(sym, spot_price=spot, ctx=ctx)
+                    self.open_sniper(sym, spot_price=spot, ctx=self.context())
 
     # ── private: risk guard ───────────────────────────────────────────────────
 
@@ -776,19 +953,389 @@ class Strategy:
         return self.urgent_retry if retry_kind == "urgent" else self.patient_retry
 
     def _live_qty(self, pos_row: Optional[dict]) -> int:
-        if pos_row is None:
-            return 0
-        return int(abs(float(pos_row.get("position", 0) or 0)))
+        return max(0, int(self._signed_position(pos_row)))
 
     def _working_exit_pending(self, play: Play) -> bool:
-        return bool(play.working_order and play.working_order.trade_result.side is OrderSide.SELL)
+        return play.working_order is not None
+
+    def _effective_tranche_idx(self, play: Play) -> int:
+        wo = play.working_order
+        if wo is not None and wo.reserved_tranche_idx is not None:
+            return max(play.tranche_idx, wo.reserved_tranche_idx)
+        return play.tranche_idx
+
+    def _effective_spike_fired(self, play: Play) -> bool:
+        wo = play.working_order
+        return bool(play.spike_fired or (wo is not None and wo.reserve_spike_fired))
+
+    def _apply_exit_reservations(
+        self,
+        play: Play,
+        reserved_tranche_idx: Optional[int] = None,
+        reserve_spike_fired: bool = False,
+    ) -> None:
+        if reserve_spike_fired:
+            play.spike_fired = True
+        if reserved_tranche_idx is not None:
+            play.tranche_idx = max(play.tranche_idx, reserved_tranche_idx)
+
+    def _clear_working_order(self, play: Play, commit_reservations: bool = False) -> None:
+        wo = play.working_order
+        if wo is None:
+            return
+        if commit_reservations:
+            self._apply_exit_reservations(
+                play,
+                reserved_tranche_idx=wo.reserved_tranche_idx,
+                reserve_spike_fired=wo.reserve_spike_fired,
+            )
+        play.working_order = None
+
+    @staticmethod
+    def _order_identity(result: OrderResult) -> dict:
+        return {
+            "order_id": result.order_id,
+            "perm_id": result.perm_id,
+            "native_order_id": result.native_order_id,
+            "client_id": result.client_id,
+            "account_id": result.account_id,
+            "limit_px": result.limit_px,
+            "submitted_qty": result.qty,
+        }
+
+    def _working_entry_from_result(
+        self,
+        result: OrderResult,
+        requested_qty: int,
+        remaining_qty: int,
+        attempts_used: int,
+        accounted_fills: int = 0,
+    ) -> WorkingEntry:
+        return WorkingEntry(
+            trade_result=result,
+            requested_qty=requested_qty,
+            remaining_qty=remaining_qty,
+            attempts_used=attempts_used,
+            submitted_at=_market_now(),
+            retry_kind="patient",
+            reason="entry",
+            accounted_fills=accounted_fills,
+            side=result.side.value,
+            **self._order_identity(result),
+        )
+
+    def _working_order_from_result(
+        self,
+        result: OrderResult,
+        remaining_qty: int,
+        attempts_used: int,
+        retry_kind: str,
+        reason: str,
+        accounted_fills: int = 0,
+        reserved_tranche_idx: Optional[int] = None,
+        reserve_spike_fired: bool = False,
+    ) -> WorkingOrder:
+        return WorkingOrder(
+            trade_result=result,
+            remaining_qty=remaining_qty,
+            attempts_used=attempts_used,
+            submitted_at=_market_now(),
+            retry_kind=retry_kind,
+            reason=reason,
+            accounted_fills=accounted_fills,
+            reserved_tranche_idx=reserved_tranche_idx,
+            reserve_spike_fired=reserve_spike_fired,
+            side=result.side.value,
+            **self._order_identity(result),
+        )
+
+    @staticmethod
+    def _signed_position(pos_row: Optional[dict]) -> float:
+        if pos_row is None:
+            return 0.0
+        return float(pos_row.get("position", 0) or 0)
+
+    def _sell_to_close_allowed(self, play: Play, ctx: Optional[StrategyContext] = None) -> bool:
+        """Last-line guard before submitting any SELL-to-close option order."""
+        ctx = ctx or self.context()
+        pos_row = ctx.position(play.con_id)
+        if pos_row is None:
+            print(f"[STRATEGY] {play.symbol}: no live IB position; SELL exit blocked")
+            return False
+        if str(pos_row.get("sec_type", "")).upper() != "OPT":
+            print(f"[STRATEGY] {play.symbol}: live position is not an option; SELL exit blocked")
+            return False
+        if str(pos_row.get("right", "")).upper() != Right.CALL.value:
+            print(f"[STRATEGY] {play.symbol}: only CALL option exits are supported; SELL exit blocked")
+            return False
+        signed_qty = self._signed_position(pos_row)
+        if signed_qty <= 0:
+            print(
+                f"[STRATEGY] {play.symbol}: live option quantity is {signed_qty:g}; "
+                "SELL-to-close blocked to avoid increasing a short position"
+            )
+            return False
+        if qty_limit := int(signed_qty):
+            if play.qty_open > qty_limit:
+                play.qty_open = qty_limit
+        return True
+
+    def _manual_tranche_reservation(
+        self, play: Play, ctx: StrategyContext
+    ) -> Optional[int]:
+        ep = play.exit_profile
+        if not ep.tranches or play.qty_open <= 0:
+            return None
+        current_price = self.price_for_play(play, ctx)
+        if current_price is None:
+            return None
+        pnl_pct = play.current_pnl_pct(current_price)
+        reserved_idx = play.tranche_idx
+        while (
+            reserved_idx < len(ep.tranches)
+            and pnl_pct >= ep.tranches[reserved_idx][0]
+        ):
+            reserved_idx += 1
+        return reserved_idx if reserved_idx > play.tranche_idx else None
+
+    def manual_close(
+        self, play: Play, qty: int, ctx: Optional[StrategyContext] = None
+    ) -> tuple[bool, bool]:
+        ctx = ctx or self.context()
+        reason = f"manual close (qty={qty})"
+        if qty >= play.qty_open:
+            ok = self._close_play(play, play.qty_open, reason, ctx=ctx)
+        else:
+            ok = self._partial_close(
+                play,
+                qty,
+                reason,
+                reserved_tranche_idx=self._manual_tranche_reservation(play, ctx),
+                ctx=ctx,
+            )
+        submitted = self._working_exit_pending(play)
+        if ok:
+            state.save(self.plays, account_id=self.account.account_id)
+        return ok, submitted
+
+    def _select_live_trade(self, candidates: list, tracker) -> Optional[object]:
+        if not candidates:
+            return None
+
+        # Strong IDs first.
+        if getattr(tracker, "perm_id", None):
+            for trade in candidates:
+                if int(getattr(trade.order, "permId", 0) or 0) == int(tracker.perm_id):
+                    return trade
+        if getattr(tracker, "native_order_id", None):
+            for trade in candidates:
+                if int(getattr(trade.order, "orderId", 0) or 0) == int(tracker.native_order_id):
+                    return trade
+
+        # Fallback: account + remaining quantity + newest native order ID.
+        def _sort_key(trade) -> tuple[int, int, int]:
+            account = getattr(trade.order, "account", None)
+            account_penalty = 0 if (not tracker.account_id or account == tracker.account_id) else 1
+            remaining = self.executor.remaining_qty_from_trade(trade)
+            order_id = int(getattr(trade.order, "orderId", 0) or 0)
+            return (account_penalty, abs(remaining - tracker.remaining_qty), -order_id)
+
+        return sorted(candidates, key=_sort_key)[0]
+
+    def _copy_order_identity_to_tracker(self, tracker, result: OrderResult) -> None:
+        tracker.trade_result = result
+        tracker.status = "WORKING"
+        tracker.order_id = result.order_id
+        tracker.perm_id = result.perm_id
+        tracker.native_order_id = result.native_order_id
+        tracker.client_id = result.client_id
+        tracker.account_id = result.account_id
+        tracker.side = result.side.value
+        tracker.limit_px = result.limit_px
+        tracker.submitted_qty = result.qty
+
+    def _bind_working_order(
+        self,
+        play: Play,
+        wo: WorkingOrder,
+        live_trades_by_con_id: dict[int, list],
+    ) -> bool:
+        candidates = live_trades_by_con_id.get(play.con_id, [])
+        trade = self._select_live_trade(candidates, wo)
+        if trade is None:
+            return False
+        candidates.remove(trade)
+        result = self.executor.result_from_trade(trade)
+        self._copy_order_identity_to_tracker(wo, result)
+        print(
+            f"[STRATEGY] Restored live exit for {play.symbol} "
+            f"(remaining {wo.remaining_qty}, order_id={wo.order_id})"
+        )
+        return True
+
+    def _bind_working_entry(
+        self,
+        play: Play,
+        we: WorkingEntry,
+        live_trades_by_con_id: dict[int, list],
+    ) -> bool:
+        candidates = live_trades_by_con_id.get(play.con_id, [])
+        trade = self._select_live_trade(candidates, we)
+        if trade is None:
+            return False
+        candidates.remove(trade)
+        result = self.executor.result_from_trade(trade)
+        self._copy_order_identity_to_tracker(we, result)
+        print(
+            f"[STRATEGY] Restored live entry for {play.symbol} "
+            f"(remaining {we.remaining_qty}, order_id={we.order_id})"
+        )
+        return True
+
+    def restore_working_entries(self, ctx: Optional[StrategyContext] = None) -> bool:
+        ctx = ctx or self.context()
+        dirty = False
+        live_trades_by_con_id: dict[int, list] = {}
+        for trade in self.executor.live_trades(side=OrderSide.BUY):
+            con_id = int(getattr(getattr(trade, "contract", None), "conId", 0) or 0)
+            if not con_id:
+                continue
+            live_trades_by_con_id.setdefault(con_id, []).append(trade)
+
+        for play in [p for p in self.plays if p.working_entry is not None]:
+            we = play.working_entry
+            if we is None or we.trade_result is not None:
+                continue
+            if self._bind_working_entry(play, we, live_trades_by_con_id):
+                dirty = True
+                continue
+
+            pos_row = ctx.position(play.con_id)
+            live_qty = self._live_qty(pos_row)
+            if live_qty > play.qty_open:
+                delta = live_qty - play.qty_open
+                play.qty_open = live_qty
+                play.qty_initial = max(play.qty_initial, live_qty)
+                play.status = PlayStatus.OPEN
+                we.remaining_qty = max(0, we.remaining_qty - delta)
+                dirty = True
+                print(f"[STRATEGY] {play.symbol} restored pending entry via live-position reconciliation")
+
+            if we.remaining_qty <= 0:
+                play.working_entry = None
+            else:
+                we.status = "UNBOUND"
+                dirty = True
+                print(
+                    f"[STRATEGY] ⚠ Could not rebind pending entry for {play.symbol}; "
+                    "leaving it blocked to avoid duplicate BUY."
+                )
+        return dirty
+
+    def restore_working_orders(self, ctx: Optional[StrategyContext] = None) -> bool:
+        ctx = ctx or self.context()
+        dirty = False
+        live_trades_by_con_id: dict[int, list] = {}
+        for trade in self.executor.live_trades(side=OrderSide.SELL):
+            con_id = int(getattr(getattr(trade, "contract", None), "conId", 0) or 0)
+            if not con_id:
+                continue
+            live_trades_by_con_id.setdefault(con_id, []).append(trade)
+
+        for play in [p for p in self.plays if p.working_order is not None]:
+            wo = play.working_order
+            if wo is None or wo.trade_result is not None:
+                continue
+            if self._bind_working_order(play, wo, live_trades_by_con_id):
+                dirty = True
+                continue
+
+            pos_row = ctx.position(play.con_id)
+            live_qty = self._live_qty(pos_row)
+            had_fill = False
+            if live_qty < play.qty_open:
+                delta = play.qty_open - live_qty
+                play.qty_open = live_qty
+                wo.remaining_qty = max(0, wo.remaining_qty - delta)
+                play.status = PlayStatus.CLOSED if live_qty <= 0 else PlayStatus.SCALING
+                had_fill = True
+
+            if play.qty_open <= 0 or wo.remaining_qty <= 0:
+                self._clear_working_order(
+                    play,
+                    commit_reservations=had_fill or wo.accounted_fills > 0 or wo.remaining_qty <= 0,
+                )
+                print(
+                    f"[STRATEGY] {play.symbol} restored pending exit via live-position reconciliation"
+                )
+            else:
+                wo.status = "UNBOUND"
+                # Keep the working order attached. This blocks automatic duplicate SELLs
+                # unless the operator explicitly clears the condition later.
+                print(
+                    f"[STRATEGY] ⚠ Could not rebind pending exit for {play.symbol}; "
+                    "leaving it blocked to avoid duplicate SELL."
+                )
+            dirty = True
+        return dirty
+
+    def _advance_working_entries(self, ctx: StrategyContext) -> bool:
+        dirty = False
+        for play in [p for p in self.plays if p.working_entry is not None]:
+            we = play.working_entry
+            if we is None:
+                continue
+
+            if we.trade_result is not None:
+                trade_result = we.trade_result
+                trade_filled = trade_result.filled_qty()
+                if trade_filled > we.accounted_fills:
+                    delta = trade_filled - we.accounted_fills
+                    fill_px = trade_result.avg_fill() or trade_result.limit_px or play.entry_price
+                    old_qty = max(0, play.qty_open)
+                    new_qty = old_qty + delta
+                    if new_qty > 0 and fill_px and fill_px > 0:
+                        play.entry_price = (
+                            ((play.entry_price * old_qty) + (float(fill_px) * delta)) / new_qty
+                            if old_qty > 0 else float(fill_px)
+                        )
+                    play.qty_open = new_qty
+                    play.qty_initial = max(play.qty_initial + delta, new_qty)
+                    play.status = PlayStatus.OPEN
+                    we.accounted_fills = trade_filled
+                    we.remaining_qty = max(0, we.remaining_qty - delta)
+                    dirty = True
+
+                pos_row = ctx.position(play.con_id)
+                live_qty = self._live_qty(pos_row)
+                if live_qty > play.qty_open:
+                    delta = live_qty - play.qty_open
+                    play.qty_open = live_qty
+                    play.qty_initial = max(play.qty_initial + delta, live_qty)
+                    play.status = PlayStatus.OPEN
+                    we.remaining_qty = max(0, we.remaining_qty - delta)
+                    dirty = True
+
+                if self.executor.is_live(trade_result):
+                    continue
+
+            # If the entry order is no longer live, no more entry fills should arrive.
+            if we.remaining_qty <= 0 or we.trade_result is not None:
+                play.working_entry = None
+                if play.qty_open <= 0:
+                    play.qty_open = 0
+                    play.qty_initial = 0
+                    play.status = PlayStatus.CLOSED
+                    print(f"[STRATEGY] {play.symbol} PENDING entry ended with no fill → CLOSED")
+                dirty = True
+        return dirty
 
     def _advance_working_orders(self, ctx: StrategyContext) -> bool:
         dirty = False
         now = _market_now()
         for play in [p for p in self.plays if self._working_exit_pending(p)]:
             wo = play.working_order
-            if wo is None:
+            if wo is None or wo.trade_result is None:
                 continue
 
             trade_result = wo.trade_result
@@ -799,7 +1346,14 @@ class Strategy:
                 if delta > 0:
                     play.qty_open -= delta
                     wo.remaining_qty = max(0, wo.remaining_qty - delta)
-                    play.status = PlayStatus.CLOSED if play.qty_open <= 0 else PlayStatus.SCALING
+                    play.status = (
+                        PlayStatus.CLOSED if play.qty_open <= 0 else PlayStatus.SCALING
+                    )
+                    self._apply_exit_reservations(
+                        play,
+                        reserved_tranche_idx=wo.reserved_tranche_idx,
+                        reserve_spike_fired=wo.reserve_spike_fired,
+                    )
                     dirty = True
 
             pos_row = ctx.position(play.con_id)
@@ -809,12 +1363,20 @@ class Strategy:
                 play.qty_open = live_qty
                 wo.remaining_qty = max(0, wo.remaining_qty - delta)
                 play.status = PlayStatus.CLOSED if live_qty <= 0 else PlayStatus.SCALING
+                self._apply_exit_reservations(
+                    play,
+                    reserved_tranche_idx=wo.reserved_tranche_idx,
+                    reserve_spike_fired=wo.reserve_spike_fired,
+                )
                 dirty = True
 
             if play.qty_open <= 0 or wo.remaining_qty <= 0:
                 play.qty_open = max(0, play.qty_open)
                 play.status = PlayStatus.CLOSED if play.qty_open == 0 else PlayStatus.SCALING
-                play.working_order = None
+                self._clear_working_order(
+                    play,
+                    commit_reservations=wo.accounted_fills > 0 or wo.remaining_qty <= 0,
+                )
                 dirty = True
                 continue
 
@@ -827,46 +1389,54 @@ class Strategy:
                 if elapsed >= profile.fill_timeout_secs and not wo.cancel_requested:
                     self.executor.cancel(trade_result)
                     wo.cancel_requested = True
+                    dirty = True
                 continue
 
             if wo.attempts_used >= total_attempts:
                 print(
                     f"[STRATEGY] ⚠  EXIT unresolved for {play.symbol}: "
-                    f"{wo.remaining_qty} contract(s) still open after {total_attempts} attempts"
+                    f"{wo.remaining_qty} contract(s) still open after {total_attempts} attempts. "
+                    "Automatic re-submit blocked; intervene manually."
                 )
-                play.working_order = None
+                wo.status = "EXHAUSTED"
+                wo.trade_result = None
                 dirty = True
                 continue
 
             next_mode = self.executor.mode_for_attempt(
-                attempt          = wo.attempts_used,
-                total_attempts   = total_attempts,
-                mode             = profile.mode,
-                fallback_mode    = profile.fallback_mode,
-                fallback_after   = profile.fallback_after,
-                last_resort_mode = profile.last_resort_mode,
+                attempt=wo.attempts_used,
+                total_attempts=total_attempts,
+                mode=profile.mode,
+                fallback_mode=profile.fallback_mode,
+                fallback_after=profile.fallback_after,
+                last_resort_mode=profile.last_resort_mode,
             )
             try:
                 result = self.executor.submit_option_order(
-                    side  = OrderSide.SELL,
-                    con_id= play.con_id,
-                    qty   = wo.remaining_qty,
-                    mode  = next_mode,
+                    side=OrderSide.SELL,
+                    con_id=play.con_id,
+                    qty=wo.remaining_qty,
+                    mode=next_mode,
                 )
             except Exception as exc:
-                print(f"[STRATEGY] ⚠  EXIT retry failed for {play.symbol}: {exc}")
-                play.working_order = None
+                print(
+                    f"[STRATEGY] ⚠  EXIT retry failed for {play.symbol}: {exc}. "
+                    "Automatic re-submit blocked."
+                )
+                wo.status = "EXHAUSTED"
+                wo.trade_result = None
                 dirty = True
                 continue
 
             play.orders.append(result)
-            play.working_order = WorkingOrder(
-                trade_result   = result,
-                remaining_qty  = wo.remaining_qty,
-                attempts_used  = wo.attempts_used + 1,
-                submitted_at   = _market_now(),
-                retry_kind     = wo.retry_kind,
-                reason         = wo.reason,
+            play.working_order = self._working_order_from_result(
+                result=result,
+                remaining_qty=wo.remaining_qty,
+                attempts_used=wo.attempts_used + 1,
+                retry_kind=wo.retry_kind,
+                reason=wo.reason,
+                reserved_tranche_idx=wo.reserved_tranche_idx,
+                reserve_spike_fired=wo.reserve_spike_fired,
             )
             dirty = True
             print(
@@ -879,13 +1449,16 @@ class Strategy:
     # ── private: monitoring ───────────────────────────────────────────────────
 
     def _monitor_plays(self, ctx: StrategyContext) -> None:
-        dirty = self._advance_working_orders(ctx)
+        dirty = self.restore_working_entries(ctx)
+        dirty |= self.restore_working_orders(ctx)
+        dirty |= self._advance_working_entries(ctx)
+        dirty |= self._advance_working_orders(ctx)
 
         # promote PENDING or expire stale ones
         for play in [p for p in self.plays if p.status == PlayStatus.PENDING]:
             pos_row = ctx.position(play.con_id)
             if pos_row is not None:
-                live_qty = int(abs(float(pos_row.get("position", 0))))
+                live_qty = self._live_qty(pos_row)
                 avg_cost = float(pos_row.get("avg_cost", 0) or 0)
                 if live_qty > 0:
                     play.qty_initial = live_qty
@@ -904,6 +1477,16 @@ class Strategy:
 
             # No IB position — check if PENDING has exceeded max age.
             if play.hours_since_entry() >= self.pending_max_hours:
+                if play.working_entry is not None:
+                    if play.working_entry.status != "EXHAUSTED":
+                        play.working_entry.status = "EXHAUSTED"
+                        dirty = True
+                        print(
+                            f"[STRATEGY] ⚠  {play.symbol} pending entry unresolved "
+                            f"after {self.pending_max_hours:.0f}h; keeping play blocked "
+                            "until the operator verifies/clears the live order"
+                        )
+                    continue
                 play.qty_open = 0
                 play.status   = PlayStatus.CLOSED
                 dirty = True
@@ -938,20 +1521,56 @@ class Strategy:
           6. VELOCITY SPIKE         → aggressive partial (once only)
           7. Tranches (THESIS+APPROACH+SENTINEL)→ partial (one per cycle)
         """
+        dirty = False
         pos_row = ctx.position(play.con_id)
+        if pos_row is None:
+            play.qty_open = 0
+            play.status = PlayStatus.CLOSED
+            self._clear_working_order(play)
+            print(f"[STRATEGY] {play.symbol} vanished from IB → CLOSED")
+            return True
+
+        signed_qty = self._signed_position(pos_row)
+        if signed_qty < 0:
+            play.qty_open = 0
+            play.status = PlayStatus.CLOSED
+            self._clear_working_order(play)
+            print(
+                f"[STRATEGY] ⚠ {play.symbol} con_id={play.con_id} is short at IB. "
+                "Automatic SELL exits disabled; play closed locally. Manage manually."
+            )
+            return True
+        if signed_qty == 0:
+            play.qty_open = 0
+            play.status = PlayStatus.CLOSED
+            self._clear_working_order(play)
+            print(f"[STRATEGY] {play.symbol} position is zero at IB → CLOSED")
+            return True
+        if str(pos_row.get("right", "")).upper() != Right.CALL.value:
+            play.qty_open = 0
+            play.status = PlayStatus.CLOSED
+            self._clear_working_order(play)
+            print(
+                f"[STRATEGY] ⚠ {play.symbol} con_id={play.con_id} is not a CALL. "
+                "Automatic exits disabled; play closed locally."
+            )
+            return True
+
+        live_qty = int(signed_qty)
+        if live_qty != play.qty_open:
+            print(f"[STRATEGY] {play.symbol} qty {play.qty_open}→{live_qty} (live sync)")
+            play.qty_open = live_qty
+            play.status = PlayStatus.OPEN if live_qty >= play.qty_initial else PlayStatus.SCALING
+            dirty = True
+
         current_price = (
             self._price_from_position(pos_row)
             or self._price_from_market(play, ctx)
         )
         if current_price is None:
-            if pos_row is None:
-                play.qty_open = 0
-                play.status   = PlayStatus.CLOSED
-                print(f"[STRATEGY] {play.symbol} vanished from IB → CLOSED")
-                return True
             # Position exists but no price data — still check time-based exits
             # such as DTE floor. Skip price-based exits until pricing recovers.
-            ep  = play.exit_profile
+            ep = play.exit_profile
             qty = play.qty_open
             expiry_str = str(pos_row.get("expiry") or "")
             if expiry_str:
@@ -962,7 +1581,8 @@ class Strategy:
                         return self._close_play(
                             play, qty,
                             f"DTE floor ({dte} ≤ {ep.dte_floor}), no price data",
-                        )
+                            ctx=ctx,
+                        ) or dirty
                 except ValueError:
                     pass
             if (
@@ -971,25 +1591,28 @@ class Strategy:
                 and play.hours_since_entry() / 24 >= ep.max_hold_days
             ):
                 return self._close_play(
-                    play, qty, f"max hold ({ep.max_hold_days}d), no price data"
-                )
-            return False
+                    play, qty, f"max hold ({ep.max_hold_days}d), no price data", ctx=ctx
+                ) or dirty
+            return dirty
 
         pnl_pct = play.current_pnl_pct(current_price)
+        old_peak = play.peak_pnl_pct
+        old_len = len(play.pnl_history)
         play.record_pnl(pnl_pct)
-        ep  = play.exit_profile
+        dirty = dirty or play.peak_pnl_pct != old_peak or len(play.pnl_history) != old_len
+        ep = play.exit_profile
         qty = play.qty_open
 
         # ── 1. DTE floor ─────────────────────────────────────────────────
-        expiry_str = str(pos_row.get("expiry") or "") if pos_row is not None else ""
+        expiry_str = str(pos_row.get("expiry") or "")
         if expiry_str:
             try:
                 exp_date = datetime.strptime(expiry_str, "%Y%m%d").date()
                 dte = (exp_date - _market_date()).days
                 if dte <= ep.dte_floor:
                     return self._close_play(
-                        play, qty, f"DTE floor ({dte} ≤ {ep.dte_floor})"
-                    )
+                        play, qty, f"DTE floor ({dte} ≤ {ep.dte_floor})", ctx=ctx
+                    ) or dirty
             except ValueError:
                 pass
 
@@ -998,17 +1621,14 @@ class Strategy:
             return self._close_play(
                 play, qty, f"stop loss ({pnl_pct:.1%})",
                 retry=self.urgent_retry,
-            )
+                ctx=ctx,
+            ) or dirty
 
         # ── 3. Full exit target ──────────────────────────────────────────
         if pnl_pct >= ep.full_exit_pct:
-            return self._close_play(play, qty, f"full target ({pnl_pct:.1%})")
+            return self._close_play(play, qty, f"full target ({pnl_pct:.1%})", ctx=ctx) or dirty
 
         # ── 4. Trailing stop ─────────────────────────────────────────────
-        # Only activate once the peak has reached at least the trailing
-        # distance itself.  A tiny +1% peak with a 30% trail would never
-        # fire meaningfully (the stop loss catches it first), but with a
-        # tight custom trail it could fire at a worse level than intended.
         if (
             ep.trailing_stop_pct is not None
             and play.peak_pnl_pct >= ep.trailing_stop_pct
@@ -1020,24 +1640,21 @@ class Strategy:
                     f"trailing stop (peak={play.peak_pnl_pct:.1%} "
                     f"now={pnl_pct:.1%} dd={dd:.1%})",
                     retry=self.urgent_retry,
-                )
+                    ctx=ctx,
+                ) or dirty
 
         # ── 5. Max hold days ─────────────────────────────────────────────
         if play.entry_time_known and ep.max_hold_days > 0:
             if play.hours_since_entry() / 24 >= ep.max_hold_days:
-                return self._close_play(play, qty, f"max hold ({ep.max_hold_days}d)")
+                return self._close_play(play, qty, f"max hold ({ep.max_hold_days}d)", ctx=ctx) or dirty
+
+        effective_tranche_idx = self._effective_tranche_idx(play)
+        effective_spike_fired = self._effective_spike_fired(play)
 
         # ── 6. VELOCITY SPIKE EXIT ───────────────────────────────────────
-        #
-        # Measures P&L *change* within the lookback window, not absolute
-        # level.  +30% → +130% in 4h triggers (gain=100%).
-        # +130% reached over 2 weeks does NOT.
-        #
-        # After firing: advance tranche_idx past covered tranches
-        # so the tranche logic doesn't double-sell.
         if (
             play.entry_time_known
-            and not play.spike_fired
+            and not effective_spike_fired
             and ep.spike_pct > 0
             and ep.spike_window_hours > 0
             and ep.spike_sell_ratio > 0
@@ -1051,74 +1668,93 @@ class Strategy:
                     play.qty_open - 1,
                 )
                 if sell_qty >= 1:
-                    ok = self._partial_close(
-                        play, sell_qty,
+                    reserved_tranche_idx = None
+                    if ep.tranches:
+                        reserved_tranche_idx = effective_tranche_idx
+                        while (
+                            reserved_tranche_idx < len(ep.tranches)
+                            and pnl_pct >= ep.tranches[reserved_tranche_idx][0]
+                        ):
+                            reserved_tranche_idx += 1
+                        if reserved_tranche_idx <= play.tranche_idx:
+                            reserved_tranche_idx = None
+                    return self._partial_close(
+                        play,
+                        sell_qty,
                         f"SPIKE (+{gain:.0%} in <{ep.spike_window_hours:.0f}h, "
                         f"sell {ep.spike_sell_ratio:.0%} = {sell_qty}/{play.qty_open})",
-                    )
-                    if ok:
-                        play.spike_fired = True
-                        if ep.tranches:
-                            while (
-                                play.tranche_idx < len(ep.tranches)
-                                and pnl_pct >= ep.tranches[play.tranche_idx][0]
-                            ):
-                                play.tranche_idx += 1
-                        return True
-                    return False
+                        reserved_tranche_idx=reserved_tranche_idx,
+                        reserve_spike_fired=True,
+                        ctx=ctx,
+                    ) or dirty
 
         # ── 7. Tranche-based scale-out ─────────────────────────────────
-        # Skip tranches when only 1 contract remains — the last contract
-        # exits via hard exits only (stop, full target, trail, DTE, max hold).
         if (
             ep.tranches
-            and play.tranche_idx < len(ep.tranches)
+            and effective_tranche_idx < len(ep.tranches)
             and play.qty_open > 1
         ):
-            trigger, fraction = ep.tranches[play.tranche_idx]
+            trigger, fraction = ep.tranches[effective_tranche_idx]
             if pnl_pct >= trigger:
                 sell_qty = min(
                     max(1, round(play.qty_initial * fraction)),
                     play.qty_open - 1,
                 )
-                if self._partial_close(
-                    play, sell_qty,
-                    f"tranche {play.tranche_idx+1}/{len(ep.tranches)} "
+                return self._partial_close(
+                    play,
+                    sell_qty,
+                    f"tranche {effective_tranche_idx+1}/{len(ep.tranches)} "
                     f"({pnl_pct:.1%} ≥ {trigger:.0%}, "
                     f"sell {fraction:.0%} of initial)",
-                ):
-                    play.tranche_idx += 1
-                    return True
+                    reserved_tranche_idx=effective_tranche_idx + 1,
+                    ctx=ctx,
+                ) or dirty
 
-        return False
+        return dirty
 
     # ── private: order helpers ────────────────────────────────────────────────
 
     def _execute_exit(
-        self, play: Play, qty: int, reason: str,
-        retry: Optional[RetryProfile] = None, label: str = "EXIT",
+        self,
+        play: Play,
+        qty: int,
+        reason: str,
+        retry: Optional[RetryProfile] = None,
+        label: str = "EXIT",
+        reserved_tranche_idx: Optional[int] = None,
+        reserve_spike_fired: bool = False,
+        ctx: Optional[StrategyContext] = None,
     ) -> bool:
         profile = retry or self.patient_retry
+        if qty < 1:
+            print(f"[STRATEGY] {label} {play.symbol}: qty must be at least 1")
+            return False
         if self._working_exit_pending(play):
             print(f"[STRATEGY] {label} already working for {play.symbol}; skipping duplicate request")
             return True
+        if not self._sell_to_close_allowed(play, ctx):
+            return False
+        qty = min(qty, play.qty_open)
+        if qty < 1:
+            print(f"[STRATEGY] {label} {play.symbol}: no live long quantity left to sell")
+            return False
 
         total_attempts = profile.max_retries + 1
         first_mode = self.executor.mode_for_attempt(
-            attempt          = 0,
-            total_attempts   = total_attempts,
-            mode             = profile.mode,
-            fallback_mode    = profile.fallback_mode,
-            fallback_after   = profile.fallback_after,
-            last_resort_mode = profile.last_resort_mode,
+            attempt=0,
+            total_attempts=total_attempts,
+            mode=profile.mode,
+            fallback_mode=profile.fallback_mode,
+            fallback_after=profile.fallback_after,
+            last_resort_mode=profile.last_resort_mode,
         )
         print(f"[STRATEGY] {label} {play}  qty={qty}  reason={reason}")
         try:
             result = self.executor.submit_option_order(
-                side  = OrderSide.SELL,
-                con_id= play.con_id,
-                qty   = qty,
-                mode  = first_mode,
+                side=OrderSide.SELL,
+                con_id=play.con_id,
+                qty=qty,
+                mode=first_mode,
             )
         except Exception as e:
             print(f"[STRATEGY] ⚠  {label} failed: {e}")
@@ -1129,45 +1765,71 @@ class Strategy:
         play.qty_open -= filled
         if play.qty_open <= 0:
             play.qty_open = 0
-            play.status   = PlayStatus.CLOSED
+            play.status = PlayStatus.CLOSED
         elif filled > 0:
             play.status = PlayStatus.SCALING
+
+        if filled > 0:
+            self._apply_exit_reservations(
+                play,
+                reserved_tranche_idx=reserved_tranche_idx,
+                reserve_spike_fired=reserve_spike_fired,
+            )
+
         remaining = max(0, qty - filled)
         if remaining > 0 and play.qty_open > 0:
-            play.working_order = WorkingOrder(
-                trade_result   = result,
-                remaining_qty  = remaining,
-                attempts_used  = 1,
-                submitted_at   = _market_now(),
-                retry_kind     = self._retry_kind(profile),
-                reason         = reason,
-                accounted_fills= filled,
+            play.working_order = self._working_order_from_result(
+                result=result,
+                remaining_qty=remaining,
+                attempts_used=1,
+                retry_kind=self._retry_kind(profile),
+                reason=reason,
+                accounted_fills=filled,
+                reserved_tranche_idx=reserved_tranche_idx,
+                reserve_spike_fired=reserve_spike_fired,
             )
             print(
                 f"[STRATEGY] {label} submitted asynchronously for {play.symbol} "
                 f"({remaining} contract(s) still working)"
             )
-        return filled > 0
+        return filled > 0 or play.working_order is not None
 
     def _close_play(
         self, play: Play, qty: int, reason: str,
         retry: Optional[RetryProfile] = None,
+        ctx: Optional[StrategyContext] = None,
     ) -> bool:
-        return self._execute_exit(play, qty, reason, retry=retry, label="CLOSE")
+        return self._execute_exit(play, qty, reason, retry=retry, label="CLOSE", ctx=ctx)
 
     def _partial_close(
-        self, play: Play, qty: int, reason: str,
+        self,
+        play: Play,
+        qty: int,
+        reason: str,
         retry: Optional[RetryProfile] = None,
+        reserved_tranche_idx: Optional[int] = None,
+        reserve_spike_fired: bool = False,
+        ctx: Optional[StrategyContext] = None,
     ) -> bool:
-        return self._execute_exit(play, qty, reason, retry=retry, label="PARTIAL")
+        return self._execute_exit(
+            play,
+            qty,
+            reason,
+            retry=retry,
+            label="PARTIAL",
+            reserved_tranche_idx=reserved_tranche_idx,
+            reserve_spike_fired=reserve_spike_fired,
+            ctx=ctx,
+        )
 
     # ── private: sizing & helpers ─────────────────────────────────────────────
 
     def _size_qty(
-        self, risk: PortfolioRisk,
+        self, ctx: StrategyContext,
         conviction: ConvictionLevel, ask_price: float,
     ) -> int:
-        max_usd = risk.headroom() * conviction.value
+        desired = ctx.risk.headroom() * conviction.value
+        max_usd = self._entry_budget(ctx, desired)
         if max_usd <= 0 or ask_price <= 0:
             return 0
         return max(0, int(max_usd / (ask_price * 100)))
@@ -1179,8 +1841,8 @@ class Strategy:
         exit_profile: ExitProfile,
         ctx: Optional[StrategyContext] = None,
     ) -> Optional[Play]:
-        def _size(risk, _nav, ask):
-            return self._size_qty(risk, conviction, ask)
+        def _size(ctx_: StrategyContext, ask: float) -> int:
+            return self._size_qty(ctx_, conviction, ask)
         return self._open_entry(
             play_type=play_type, symbol=symbol, spec=spec,
             size_fn=_size, exit_profile=exit_profile, ctx=ctx,
@@ -1193,19 +1855,23 @@ class Strategy:
     ) -> Optional[Play]:
         """Shared entry flow: snapshot → risk → chain → size → buy → make_play."""
         ctx = ctx or self.context()
-        if not self._risk_guard(ctx.risk):
-            return None
         chain = OptionChain(self.ib, symbol)
         picks = chain.select(**spec.to_kwargs())
         if picks.empty:
             print(f"[STRATEGY] {play_type.value} {symbol.upper()}: no qualifying contract")
             return None
         row = picks.iloc[0]
+        if self._reject_non_call_row(row, symbol, play_type.value):
+            return None
+        contract_currency = str(row.get("currency", self.executor.currency) or self.executor.currency)
+        if not self._entry_guard(ctx, contract_currency):
+            return None
+        self._print_soft_contract_warnings(row, spec, symbol)
         con_id = int(row["con_id"])
         if self._reject_duplicate_contract(con_id, symbol):
             return None
         ask = float(row["ask"])
-        qty = size_fn(ctx.risk, ctx.snapshot.nav, ask)
+        qty = size_fn(ctx, ask)
         if qty < 1:
             print(f"[STRATEGY] {play_type.value} {symbol.upper()}: insufficient headroom")
             return None
@@ -1224,37 +1890,72 @@ class Strategy:
         self, play_type: PlayType, symbol: str, con_id: int,
         qty: int, entry_price: float, entry_nav: float,
         exit_profile: ExitProfile, order_result: OrderResult,
-    ) -> Play:
-        filled = order_result.total_filled
+    ) -> Optional[Play]:
+        filled = int(order_result.total_filled or 0)
+        actual_price = order_result.total_avg_fill() or order_result.limit_px or entry_price
+        remaining = max(0, int(order_result.unfilled_qty or (qty - filled)))
+
+        if filled <= 0 and not order_result.last_order_live:
+            print(f"[STRATEGY] {symbol}: entry unfilled and no live order remains — no play created")
+            return None
+
         if filled <= 0:
             play = Play(
                 play_id      = uuid4().hex[:12],
                 account_id   = self.account.account_id or "",
-                play_type=play_type, symbol=symbol, con_id=con_id,
-                qty_initial=qty, qty_open=qty, entry_time=_market_now(),
-                entry_price=entry_price, entry_nav=entry_nav,
-                exit_profile=exit_profile, status=PlayStatus.PENDING,
+                play_type    = play_type,
+                symbol       = symbol,
+                con_id       = con_id,
+                qty_initial  = 0,
+                qty_open     = 0,
+                entry_time   = _market_now(),
+                entry_price  = actual_price,
+                entry_nav    = entry_nav,
+                exit_profile = exit_profile,
+                status       = PlayStatus.PENDING,
+                working_entry = self._working_entry_from_result(
+                    result=order_result,
+                    requested_qty=qty,
+                    remaining_qty=remaining or qty,
+                    attempts_used=1,
+                    accounted_fills=0,
+                ),
             )
             play.orders.append(order_result)
             self.plays.append(play)
             state.save(self.plays, account_id=self.account.account_id)
-            print(f"[STRATEGY] ⚠ Unfilled — {symbol} saved as PENDING")
+            print(f"[STRATEGY] ⚠ {symbol}: entry still live/unresolved — saved as PENDING")
             return play
 
-        actual_price = order_result.total_avg_fill() or order_result.limit_px or entry_price
         play = Play(
             play_id      = uuid4().hex[:12],
             account_id   = self.account.account_id or "",
-            play_type=play_type, symbol=symbol, con_id=con_id,
-            qty_initial=filled, qty_open=filled, entry_time=_market_now(),
-            entry_price=actual_price, entry_nav=entry_nav,
-            exit_profile=exit_profile, status=PlayStatus.OPEN,
+            play_type    = play_type,
+            symbol       = symbol,
+            con_id       = con_id,
+            qty_initial  = filled,
+            qty_open     = filled,
+            entry_time   = _market_now(),
+            entry_price  = actual_price,
+            entry_nav    = entry_nav,
+            exit_profile = exit_profile,
+            status       = PlayStatus.OPEN,
         )
         play.orders.append(order_result)
+        if remaining > 0 and order_result.last_order_live:
+            play.working_entry = self._working_entry_from_result(
+                result=order_result,
+                requested_qty=qty,
+                remaining_qty=remaining,
+                attempts_used=1,
+                accounted_fills=order_result.filled_qty(),
+            )
+            print(f"[STRATEGY] ⚠ Partial fill {filled}/{qty} @ {actual_price:.2f}; remaining entry still working")
+        elif filled < qty:
+            print(f"[STRATEGY] ⚠ Partial fill {filled}/{qty} @ {actual_price:.2f}; no live entry remains")
+
         self.plays.append(play)
         state.save(self.plays, account_id=self.account.account_id)
-        if filled < qty:
-            print(f"[STRATEGY] ⚠ Partial fill {filled}/{qty} @ {actual_price:.2f}")
         print(f"[STRATEGY] Opened: {play}")
         return play
 

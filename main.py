@@ -211,7 +211,7 @@ def do_plays(strat: Strategy, ib, args: list[str]):
 
         spike_mark = " ⚡" if p.spike_fired else ""
         working_mark = ""
-        if p.working_order and p.working_order.trade_result.side.value == "SELL":
+        if p.working_order:
             working_mark = " [exit]"
         t.add_row(
             str(i), p.play_type.value, p.symbol,
@@ -276,7 +276,7 @@ def _play_detail(strat: Strategy, args: list[str]):
     if gain is not None and p.entry_time_known:
         pos_rows.append((f"Gain ({ep.spike_window_hours:.0f}h)", f"{gain:+.1%}"))
     pos_rows.append(("Spike fired", "yes" if p.spike_fired else "no"))
-    if p.working_order and p.working_order.trade_result.side.value == "SELL":
+    if p.working_order:
         pos_rows.append((
             "Exit order",
             f"{p.working_order.remaining_qty} working  "
@@ -349,10 +349,12 @@ def do_cfg(strat: Strategy, ib, args: list[str]):
 
     # ── general ──
     gen = _kvtable(
+        ("Config path",        str(CFG.path)),
         ("Loop interval",      f"{CFG.loop_interval}s"),
         ("Risk ceiling",       f"{CFG.risk_ceiling:.0%}"),
         ("Approach max NAV",   f"{CFG.approach_max_nav_pct:.1%}"),
         ("Sentinel max NAV",   f"{CFG.sentinel_max_nav_pct:.1%}"),
+        ("IB",                 f"{CFG.ib_host}:{CFG.ib_port}  clientId={CFG.ib_client_id}"),
         title="General",
     )
 
@@ -433,8 +435,10 @@ def do_cfg(strat: Strategy, ib, args: list[str]):
         total = rp.max_retries + 1
         mins  = total * rp.fill_timeout_secs / 60
         lr    = rp.last_resort_mode.value if rp.last_resort_mode else "─"
-        return (f"{rp.mode.value}→{rp.fallback_mode.value} "
-                f"(after {rp.fallback_after}), last={lr}",
+        fallback = rp.fallback_mode.value if rp.fallback_mode else "─"
+        after = rp.fallback_after if rp.fallback_after is not None else "─"
+        return (f"{rp.mode.value}→{fallback} "
+                f"(after {after}), last={lr}",
                 f"{total} × {rp.fill_timeout_secs}s  (~{mins:.0f} min)")
 
     p_modes, p_timing = _retry_row(CFG.patient)
@@ -457,7 +461,7 @@ def do_cfg(strat: Strategy, ib, args: list[str]):
     inner.add_row(ex_t)
 
     _con.print()
-    _con.print(Panel(inner, title="Configuration  (config.toml)", border_style="dim", padding=(1, 2)))
+    _con.print(Panel(inner, title=f"Configuration  ({CFG.path.name})", border_style="dim", padding=(1, 2)))
 
 
 # ── chain ───────────────────────────────────────────────────────────────────
@@ -556,7 +560,10 @@ def do_chain(strat: Strategy, ib, args: list[str]):
 
 def do_thesis(strat: Strategy, ib, args: list[str]):
     if len(args) < 2:
-        print("  Usage: thesis <SYM> <low|med|high> [put]")
+        print("  Usage: thesis <SYM> <low|med|high>")
+        return
+    if len(args) >= 3 and args[2].lower() == "put":
+        print("  PUT entries are disabled; this strategy is CALL-only for now.")
         return
     sym = args[0].upper()
     if strat._has_open_play(sym, PlayType.THESIS):
@@ -566,36 +573,39 @@ def do_thesis(strat: Strategy, ib, args: list[str]):
     if conv is None:
         print(f"  Unknown conviction '{args[1]}' — use low, med, or high")
         return
-    right = Right.PUT if len(args) >= 3 and args[2].lower() == "put" else Right.CALL
-    strat.open_thesis(sym, conv, right=right)
+    strat.open_thesis(sym, conv, right=Right.CALL)
 
 
 # ── approach ────────────────────────────────────────────────────────────────
 
 def do_approach(strat: Strategy, ib, args: list[str]):
     if not args:
-        print("  Usage: approach <SYM> [put]")
+        print("  Usage: approach <SYM>")
+        return
+    if len(args) >= 2 and args[1].lower() == "put":
+        print("  PUT entries are disabled; this strategy is CALL-only for now.")
         return
     sym = args[0].upper()
     if strat._has_open_play(sym, PlayType.APPROACH):
         print(f"  Already have an open APPROACH on {sym}. Use 'close' first.")
         return
-    right = Right.PUT if len(args) >= 2 and args[1].lower() == "put" else Right.CALL
-    strat.open_approach(sym, right=right)
+    strat.open_approach(sym, right=Right.CALL)
 
 
 # ── sentinel ────────────────────────────────────────────────────────────────
 
 def do_sentinel(strat: Strategy, ib, args: list[str]):
     if not args:
-        print("  Usage: sentinel <SYM> [put]")
+        print("  Usage: sentinel <SYM>")
+        return
+    if len(args) >= 2 and args[1].lower() == "put":
+        print("  PUT entries are disabled; this strategy is CALL-only for now.")
         return
     sym = args[0].upper()
     if strat._has_open_play(sym, PlayType.SENTINEL):
         print(f"  Already have an open SENTINEL on {sym}. Use 'close' first.")
         return
-    right = Right.PUT if len(args) >= 2 and args[1].lower() == "put" else Right.CALL
-    strat.open_sentinel(sym, right=right)
+    strat.open_sentinel(sym, right=Right.CALL)
 
 
 # ── sniper ──────────────────────────────────────────────────────────────────
@@ -683,32 +693,7 @@ def do_close(strat: Strategy, ib, args: list[str]):
     if qty < 1:
         print("  qty must be at least 1.")
         return
-    reason = f"manual close (qty={qty})"
-    ok = False
-    if qty >= play.qty_open:
-        ok = strat._close_play(play, play.qty_open, reason)
-    else:
-        ok = strat._partial_close(play, qty, reason)
-    submitted = bool(play.working_order and play.working_order.trade_result.side.value == "SELL")
-    if ok:
-        state.save(strat.plays, account_id=strat.account.account_id)
-    # Advance tranche_idx past triggers at or below current PnL to prevent
-    # automatic tranches from double-selling after a manual close.
-    ep = play.exit_profile
-    if (ok and not submitted
-            and ep.tranches and play.status in (PlayStatus.OPEN, PlayStatus.SCALING)
-            and play.qty_open > 0):
-        ctx = strat.context()
-        cpx = strat.price_for_play(play, ctx)
-        if cpx is not None:
-            pnl = play.current_pnl_pct(cpx)
-            advanced = False
-            while (play.tranche_idx < len(ep.tranches)
-                   and pnl >= ep.tranches[play.tranche_idx][0]):
-                play.tranche_idx += 1
-                advanced = True
-            if advanced:
-                state.save(strat.plays, account_id=strat.account.account_id)
+    ok, submitted = strat.manual_close(play, qty, ctx=strat.context())
     if ok or submitted:
         if submitted:
             print(f"  Submitted close for {qty}x {play.symbol}  [{play.status.value}]")
@@ -732,6 +717,9 @@ def do_spot(strat: Strategy, ib, args: list[str]):
         qty = int(args[2])
     except ValueError:
         print("  qty must be an integer.")
+        return
+    if qty < 1:
+        print("  qty must be at least 1.")
         return
     limit = None
     if len(args) >= 4:
@@ -795,9 +783,9 @@ def do_help(strat: Strategy, ib, args: list[str]):
 
     # fmt: off
     g.add_row("[bold]PORTFOLIO[/]",                                 "[bold]TRADING[/]")
-    g.add_row("  [cyan]status[/]          overview",                r"  [cyan]thesis[/]     <SYM> <CONV> \[put]")
-    g.add_row("  [cyan]plays[/]           list plays",              r"  [cyan]approach[/]    <SYM> \[put]")
-    g.add_row("  [cyan]plays[/] <row>     detail",                  r"  [cyan]sentinel[/]    <SYM> \[put]")
+    g.add_row("  [cyan]status[/]          overview",                "  [cyan]thesis[/]     <SYM> <CONV>")
+    g.add_row("  [cyan]plays[/]           list plays",              "  [cyan]approach[/]    <SYM>")
+    g.add_row("  [cyan]plays[/] <row>     detail",                  "  [cyan]sentinel[/]    <SYM>")
     g.add_row("  [cyan]pending[/]         open orders",             "  [cyan]sniper[/]      <SYM> <PRICE>")
     g.add_row("",                                                   r"  [cyan]manual[/]      <CON> <QTY> <TYPE> \[CONV] \[SYM]")
     g.add_row("",                                                   r"  [cyan]track[/]       <CON> <TYPE> \[SYM]")
@@ -959,7 +947,7 @@ def _read_console(q: queue.Queue, stop: threading.Event):
 
 def main():
     print("Connecting to IB Gateway…")
-    ib = connect()
+    ib = connect(CFG.ib_host, CFG.ib_port, CFG.ib_client_id)
 
     policy  = CashPolicy(risk_ceiling=CFG.risk_ceiling)
     scanner = SniperScanner(
@@ -985,6 +973,8 @@ def main():
         strat.account.snapshot().positions,
         account_id=strat.account.account_id,
     )
+    if strat.restore_working_orders(strat.context()):
+        state.save(strat.plays, account_id=strat.account.account_id)
 
     stop = threading.Event()
     q: queue.Queue[str] = queue.Queue()
@@ -1026,7 +1016,9 @@ def main():
                 try:
                     time.sleep(min(5 * attempt, 30))
                     ib.disconnect()
-                    ib.connect("127.0.0.1", 4001, clientId=1)
+                    ib.connect(CFG.ib_host, CFG.ib_port, clientId=CFG.ib_client_id)
+                    if strat.restore_working_orders(strat.context()):
+                        state.save(strat.plays, account_id=strat.account.account_id)
                     print(f"  [loop] Reconnected on attempt {attempt}")
                     break
                 except Exception as re:

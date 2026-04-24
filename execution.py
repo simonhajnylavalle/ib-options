@@ -69,6 +69,11 @@ _PENDING_STATUSES = frozenset({
     "PartiallyFilled",
 })
 
+# Terminal states returned by IB once an order is no longer working.
+_TERMINAL_STATUSES = frozenset({
+    "Filled", "Cancelled", "ApiCancelled", "Inactive",
+})
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # ENUMS
@@ -167,9 +172,21 @@ class OrderResult:
     limit_px: Optional[float]
     trade:    Trade  # raw ib_insync Trade; full access to fills, log, status
 
-    # ── cross-retry fill accounting (set by _place_with_retry) ────────────
+    # Broker identity / routing. order_id is kept as the display/stable ID
+    # used by existing logs; native_order_id and perm_id preserve the raw IB
+    # fields for restart rebinding.
+    perm_id:         Optional[int] = None
+    native_order_id: Optional[int] = None
+    client_id:       Optional[int] = None
+    account_id:      Optional[str] = None
+
+    # ── cross-retry fill/accounting metadata (set by _place_with_retry) ───
     total_filled: int   = 0    # contracts filled across ALL retry attempts
     total_cost:   float = 0.0  # Σ(shares × price) — for true avg fill price
+    requested_qty: int  = 0    # original requested qty for the whole entry/exit
+    unfilled_qty:  int  = 0    # requested_qty - total_filled after return
+    last_order_live: bool = False
+    cancel_unresolved: bool = False
 
     def status(self) -> str:
         return self.trade.orderStatus.status
@@ -252,16 +269,63 @@ class Executor:
         ib:                IB,
         exchange:          str = "SMART",
         currency:          str = "USD",
+        account_id:        Optional[str] = None,
         fill_timeout_secs: int = 300,   # 5 minutes between repricing
         max_retries:       int = 3,     # total attempts = max_retries + 1
     ):
         self.ib                = ib
         self.exchange          = exchange
         self.currency          = currency
+        self.account_id        = account_id or None
         self.fill_timeout_secs = fill_timeout_secs
         self.max_retries       = max_retries
         self._contract_details_cache: dict[int, object] = {}
         self._market_rule_cache: dict[int, list] = {}
+
+    # ── private: routing / identity ──────────────────────────────────────────
+
+    def _route_order(self, order):
+        """Attach the resolved IB account to every outbound order."""
+        if self.account_id:
+            setattr(order, "account", self.account_id)
+        return order
+
+    @staticmethod
+    def _int_or_none(value) -> Optional[int]:
+        try:
+            ivalue = int(value or 0)
+        except (TypeError, ValueError):
+            return None
+        return ivalue or None
+
+    def _order_result(
+        self,
+        contract: Contract,
+        trade: Trade,
+        side: OrderSide,
+        qty: int,
+        limit_px: Optional[float],
+        requested_qty: Optional[int] = None,
+    ) -> OrderResult:
+        order = trade.order
+        perm_id = self._int_or_none(getattr(order, "permId", None))
+        native_order_id = self._int_or_none(getattr(order, "orderId", None))
+        client_id = self._int_or_none(getattr(order, "clientId", None))
+        account_id = getattr(order, "account", None) or self.account_id
+        return OrderResult(
+            order_id=perm_id or native_order_id or 0,
+            symbol=contract.symbol,
+            con_id=int(contract.conId or 0),
+            side=side,
+            qty=int(qty),
+            limit_px=limit_px,
+            trade=trade,
+            perm_id=perm_id,
+            native_order_id=native_order_id,
+            client_id=client_id,
+            account_id=account_id,
+            requested_qty=int(requested_qty if requested_qty is not None else qty),
+        )
 
     # ── option orders ────────────────────────────────────────────────────────
 
@@ -377,7 +441,8 @@ class Executor:
     def cancel(self, result: OrderResult) -> None:
         """Cancel the order associated with an OrderResult."""
         self.ib.cancelOrder(result.trade.order)
-        print(f"[EXEC] CANCEL order_id={result.order_id} "
+        acct = f" account={result.account_id}" if result.account_id else ""
+        print(f"[EXEC] CANCEL order_id={result.order_id}{acct} "
               f"({result.side.value} {result.qty} con_id={result.con_id})")
 
     def cancel_all(self) -> None:
@@ -389,6 +454,68 @@ class Executor:
         """Whether the order is still working at the exchange/IB."""
         return result.status() in _PENDING_STATUSES
 
+    def result_from_trade(self, trade: Trade) -> OrderResult:
+        """Wrap a live ib_insync Trade in OrderResult form."""
+        contract = trade.contract
+        order = trade.order
+        side = OrderSide(str(order.action).upper())
+        limit_px = order.lmtPrice if getattr(order, "orderType", "") == "LMT" else None
+        return self._order_result(
+            contract=contract,
+            trade=trade,
+            side=side,
+            qty=int(order.totalQuantity),
+            limit_px=limit_px,
+            requested_qty=int(order.totalQuantity),
+        )
+
+    def remaining_qty_from_trade(self, trade: Trade) -> int:
+        remaining = getattr(trade.orderStatus, "remaining", None)
+        if remaining is not None:
+            return int(remaining)
+        filled = sum(f.execution.shares for f in getattr(trade, "fills", []))
+        return max(0, int(getattr(trade.order, "totalQuantity", 0) - filled))
+
+    def live_trades(
+        self,
+        con_id: Optional[int] = None,
+        side: Optional[OrderSide] = None,
+    ) -> list[Trade]:
+        """Return currently live trades, optionally filtered by con_id and side."""
+        if hasattr(self.ib, "reqOpenOrders"):
+            try:
+                self.ib.reqOpenOrders()
+            except Exception:
+                pass
+        source = self.ib.openTrades() if hasattr(self.ib, "openTrades") else self.ib.trades()
+        out: list[Trade] = []
+        for trade in source:
+            status = str(getattr(trade.orderStatus, "status", ""))
+            if status not in _PENDING_STATUSES:
+                continue
+            if con_id is not None and int(getattr(trade.contract, "conId", 0) or 0) != con_id:
+                continue
+            action = str(getattr(trade.order, "action", "")).upper()
+            if side is not None and action != side.value:
+                continue
+            out.append(trade)
+        return out
+
+    def wait_until_not_live(
+        self,
+        result: OrderResult,
+        timeout_secs: float = 10.0,
+        poll_secs: float = 0.5,
+    ) -> str:
+        """Wait until an order leaves a live IB state, then return the final status."""
+        deadline = time.monotonic() + timeout_secs
+        while time.monotonic() < deadline:
+            status = result.status()
+            if status not in _PENDING_STATUSES:
+                return status
+            self.ib.sleep(poll_secs)
+        return result.status()
+
     def pending_orders(self) -> pd.DataFrame:
         """
         DataFrame of currently open / pending orders on this IB connection.
@@ -397,14 +524,15 @@ class Executor:
                  qty, filled, remaining, limit_px, status
         """
         rows = []
-        for trade in self.ib.trades():
-            if trade.orderStatus.status not in _PENDING_STATUSES:
-                continue
+        for trade in self.live_trades():
             c = trade.contract
             o = trade.order
             lmt = o.lmtPrice if (o.orderType == "LMT" and o.lmtPrice) else None
             rows.append({
                 "order_id":  o.permId or o.orderId,
+                "perm_id":   getattr(o, "permId", None),
+                "native_id": getattr(o, "orderId", None),
+                "account":   getattr(o, "account", None) or self.account_id,
                 "symbol":    c.symbol,
                 "con_id":    c.conId,
                 "sec_type":  c.secType,
@@ -493,11 +621,11 @@ class Executor:
                     continue
                 print("[EXEC] ⚠  All attempts failed — no valid market data")
                 break
-            order = LimitOrder(
+            order = self._route_order(LimitOrder(
                 action        = side.value,
                 totalQuantity = remaining_qty,
                 lmtPrice      = limit_px,
-            )
+            ))
             trade = self.ib.placeOrder(contract, order)
 
             attempt_label = f"attempt {attempt + 1}/{total_attempts}"
@@ -505,16 +633,16 @@ class Executor:
                 f"[EXEC] {attempt_label}  "
                 f"{side.value} {remaining_qty}x {contract.symbol} "
                 f"opt con_id={con_id}  lmt={limit_px:.2f}  mode={attempt_mode.value}"
+                f"{('  account=' + self.account_id) if self.account_id else ''}"
             )
 
-            last_result = OrderResult(
-                order_id = trade.order.permId or trade.order.orderId,
-                symbol   = contract.symbol,
-                con_id   = con_id,
-                side     = side,
-                qty      = remaining_qty,
-                limit_px = limit_px,
-                trade    = trade,
+            last_result = self._order_result(
+                contract=contract,
+                trade=trade,
+                side=side,
+                qty=remaining_qty,
+                limit_px=limit_px,
+                requested_qty=qty,
             )
 
             # ── wait for fill ─────────────────────────────────────────────
@@ -525,30 +653,41 @@ class Executor:
                     break
 
             was_fully_filled = trade.orderStatus.status == "Filled"
+            retry_allowed = True
 
             # ── cancel if not fully filled ────────────────────────────────
             if not was_fully_filled:
                 still_live = trade.orderStatus.status in _PENDING_STATUSES
                 if still_live:
                     self.ib.cancelOrder(trade.order)
-                    # Wait for IB to acknowledge cancel; late fills may
-                    # arrive during this window and are captured below.
-                    self.ib.sleep(2)
+                    cancel_status = self.wait_until_not_live(
+                        last_result,
+                        timeout_secs=max(5.0, min(float(fill_timeout_secs), 15.0)),
+                    )
+                    if cancel_status in _PENDING_STATUSES:
+                        retry_allowed = False
+                        print(
+                            f"[EXEC] ⚠  Cancel not yet acknowledged for order_id={last_result.order_id} "
+                            f"(status={cancel_status}). Not resubmitting to avoid overlapping live orders."
+                        )
 
             # ── account for fills AFTER any cancel to capture late
             #    fill notifications delivered during the cancel wait ────
             filled_this_attempt = last_result.filled_qty()
-            total_filled       += filled_this_attempt
+            total_filled += filled_this_attempt
             for f in trade.fills:
                 total_cost += f.execution.shares * f.execution.price
 
-            if was_fully_filled or total_filled >= qty:
+            if last_result.status() == "Filled" or total_filled >= qty:
                 if filled_this_attempt > 0:
                     print(
                         f"[EXEC] ✓ Filled {filled_this_attempt} contracts "
                         f"@ avg {last_result.avg_fill():.2f}  "
                         f"(total filled: {total_filled}/{qty})"
                     )
+                break
+
+            if not retry_allowed:
                 break
 
             if attempt < max_retries:
@@ -580,6 +719,10 @@ class Executor:
             )
         last_result.total_filled = total_filled
         last_result.total_cost   = total_cost
+        last_result.requested_qty = qty
+        last_result.unfilled_qty = max(0, qty - total_filled)
+        last_result.last_order_live = self.is_live(last_result)
+        last_result.cancel_unresolved = last_result.last_order_live
         return last_result
 
     # ── private: stock order ─────────────────────────────────────────────────
@@ -595,17 +738,17 @@ class Executor:
         self.ib.qualifyContracts(contract)
 
         if limit_price is not None:
-            order = LimitOrder(
+            order = self._route_order(LimitOrder(
                 action        = side.value,
                 totalQuantity = qty,
                 lmtPrice      = round(limit_price, 2),
-            )
+            ))
             order_desc = f"LMT {limit_price:.2f}"
         else:
-            order = MarketOrder(
+            order = self._route_order(MarketOrder(
                 action        = side.value,
                 totalQuantity = qty,
-            )
+            ))
             order_desc = "MKT"
 
         trade = self.ib.placeOrder(contract, order)
@@ -613,15 +756,15 @@ class Executor:
         print(
             f"[EXEC] {side.value} {qty}x {symbol.upper()} "
             f"stock  {order_desc}"
+            f"{('  account=' + self.account_id) if self.account_id else ''}"
         )
-        return OrderResult(
-            order_id = trade.order.permId or trade.order.orderId,
-            symbol   = symbol.upper(),
-            con_id   = contract.conId,
-            side     = side,
-            qty      = qty,
-            limit_px = limit_price,
-            trade    = trade,
+        return self._order_result(
+            contract=contract,
+            trade=trade,
+            side=side,
+            qty=qty,
+            limit_px=limit_price,
+            requested_qty=qty,
         )
 
     # ── contract resolution ───────────────────────────────────────────────────
@@ -660,24 +803,24 @@ class Executor:
             raise ValueError(f"qty must be positive, got {qty}")
         contract = self.resolve_con_id(con_id)
         limit_px, _, _ = self._option_limit_price(contract, side, mode, offset)
-        order = LimitOrder(
+        order = self._route_order(LimitOrder(
             action        = side.value,
             totalQuantity = qty,
             lmtPrice      = limit_px,
-        )
+        ))
         trade = self.ib.placeOrder(contract, order)
         print(
             f"[EXEC] submit  {side.value} {qty}x {contract.symbol} "
             f"opt con_id={con_id}  lmt={limit_px:.2f}  mode={mode.value}"
+            f"{('  account=' + self.account_id) if self.account_id else ''}"
         )
-        return OrderResult(
-            order_id = trade.order.permId or trade.order.orderId,
-            symbol   = contract.symbol,
-            con_id   = con_id,
-            side     = side,
-            qty      = qty,
-            limit_px = limit_px,
-            trade    = trade,
+        return self._order_result(
+            contract=contract,
+            trade=trade,
+            side=side,
+            qty=qty,
+            limit_px=limit_px,
+            requested_qty=qty,
         )
 
     @staticmethod

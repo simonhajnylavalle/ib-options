@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "option-algorithm"
+version = "0.1.0"
+description = "Interactive Brokers options trading console and strategy engine."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "ib-insync>=0.9.86",
+  "pandas>=2.2",
+  "rich>=13.7",
+  "tomli>=2.0; python_version < '3.11'",
+]
+
+[project.optional-dependencies]
+test = [
+  "pytest>=8.2",
+]
+
+[project.scripts]
+option-algorithm = "main:main"
+
+[tool.setuptools]
+py-modules = [
+  "config",
+  "execution",
+  "ib_core",
+  "main",
+  "paths",
+  "portfolio",
+  "state",
+  "strategy",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
