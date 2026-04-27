@@ -62,7 +62,7 @@ or:
 option-algorithm
 ```
 
-The app connects to IB using the host/port/client ID configured in `config.toml`, resolves the managed account, routes outbound orders to that account, loads any persisted plays, rebinds pending live entry/exit orders, runs an immediate strategy tick, and then continues on the configured loop interval.
+The app connects to IB using the host/port/client ID configured in `config.toml`, resolves the managed account, routes outbound orders to that account, loads any persisted plays, rebinds pending live entry/exit orders, runs an immediate strategy tick, and then continues on the configured risk loop interval. SNIPER scanning is throttled separately by `scanner_interval`, so exits can be monitored more frequently than new scanner entries.
 
 ## Live Smoke Check
 
@@ -93,7 +93,8 @@ The test suite is broker-independent. It covers:
 
 - Live trading still requires IB Gateway or TWS.
 - The strategy is intentionally long-CALL-only for now. PUT and short-option tracking are rejected.
-- Account summary values prefer IB `BASE` / configured currency rows but fall back to USD when IB only returns usable USD data for a Swiss account.
+- Account summary values prefer the configured currency first, then IB `BASE`, then USD. The sample config uses USD because the implemented option strategies trade US-listed calls.
+- Entry orders and exit orders are tracked asynchronously. Remaining premium from pending BUY orders is reserved against future option headroom so unresolved entries cannot silently over-commit the sleeve.
 - Unbound or exhausted pending orders are kept blocked until the operator verifies them, rather than auto-clearing and risking duplicate orders.
 - The live smoke check is read-only; this repository intentionally does not automate live order placement as a test.
 - `plays.json` is local process state, not a shared or durable order journal.

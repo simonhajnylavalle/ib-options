@@ -11,7 +11,7 @@ EXIT MODEL  (unified for THESIS + APPROACH + SENTINEL)
 THESIS, APPROACH, and SENTINEL plays use the same three-layer exit model:
 
   Layer 1 — Hard exits (always active)
-    stop_loss, full_exit_target, trailing_stop, DTE_floor, max_hold_days
+    stop_loss, trailing_stop, DTE_floor, max_hold_days, full_exit_target
 
   Layer 2 — Velocity spike (fires once)
     If P&L *gains* ≥ spike_pct within spike_window_hours, sell an
@@ -96,9 +96,10 @@ class PlayStatus(str, Enum):
 # config loader)
 # ─────────────────────────────────────────────────────────────────────────────
 
-_DEFAULT_APPROACH_MAX_NAV_PCT: float = 0.03
-_DEFAULT_SENTINEL_MAX_NAV_PCT: float = 0.03
-_DEFAULT_SNIPER_MAX_NAV_PCT:   float = 0.05
+_DEFAULT_THESIS_MAX_NAV_PCT:   float = 0.06
+_DEFAULT_APPROACH_MAX_NAV_PCT: float = 0.025
+_DEFAULT_SENTINEL_MAX_NAV_PCT: float = 0.010
+_DEFAULT_SNIPER_MAX_NAV_PCT:   float = 0.010
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -145,7 +146,11 @@ class ExitProfile:
     stop_loss_pct      close 100% if P&L ≤ this
     full_exit_pct      close 100% if P&L ≥ this
     dte_floor          force-close if DTE ≤ this
-    trailing_stop_pct  trail from peak P&L; None = disabled
+    trail_activate_pct / trail_drawdown_pct
+                       activate trailing only after a profit threshold, then
+                       close on a separate drawdown threshold. The legacy
+                       trailing_stop_pct field remains a backward-compatible
+                       shorthand when both new fields are omitted.
     max_hold_days      force-close after N days; 0 = no limit
 
     Velocity spike (THESIS + APPROACH + SENTINEL)
@@ -164,20 +169,31 @@ class ExitProfile:
     THESIS example: [(0.50, 0.25), (1.00, 0.35)]
       +50% → sell 25%,  +100% → sell 35%,  +150% → close all
 
-    APPROACH example:  [(0.15, 0.30), (0.30, 0.40)]
-      +15% → sell 30%,  +30% → sell 40%,   +60% → close all
+    APPROACH example:  [(0.20, 0.30), (0.40, 0.40)]
+      +20% → sell 30%,  +40% → sell 40%,   +60% → close all
       (tighter targets — don't overstay theta drag)
 
     """
     stop_loss_pct:        float
     full_exit_pct:        float
     dte_floor:            int
+    # Backward-compatible legacy field. Prefer trail_activate_pct and
+    # trail_drawdown_pct in config.toml so activation and drawdown are not
+    # accidentally tied to the same number.
     trailing_stop_pct:    Optional[float] = None
+    trail_activate_pct:   Optional[float] = None
+    trail_drawdown_pct:   Optional[float] = None
     tranches:             list[tuple[float, float]] = field(default_factory=list)
     max_hold_days:        int             = 0
     spike_pct:            float = 0.0
     spike_window_hours:   float = 0.0
     spike_sell_ratio:     float = 0.0
+
+    def trail_activate(self) -> Optional[float]:
+        return self.trail_activate_pct if self.trail_activate_pct is not None else self.trailing_stop_pct
+
+    def trail_drawdown(self) -> Optional[float]:
+        return self.trail_drawdown_pct if self.trail_drawdown_pct is not None else self.trailing_stop_pct
 
 
 @dataclass
@@ -516,6 +532,10 @@ class Strategy:
     """
 
     # Default retry profiles when none are provided (e.g. standalone usage).
+    _DEFAULT_ENTRY = RetryProfile(
+        fill_timeout_secs=30, max_retries=5, mode=PriceMode.IB_MODEL,
+        fallback_mode=PriceMode.MID, fallback_after=2, last_resort_mode=None,
+    )
     _DEFAULT_PATIENT = RetryProfile(
         fill_timeout_secs=60, max_retries=29, mode=PriceMode.IB_MODEL,
         fallback_mode=PriceMode.MID, fallback_after=10, last_resort_mode=None,
@@ -533,10 +553,13 @@ class Strategy:
         exit_profiles:     Optional[dict[str, ExitProfile]] = None,
         contract_specs:    Optional[dict[str, ContractSpec]] = None,
         sniper_scanner:       Optional[SniperScanner] = None,
+        thesis_max_nav_pct:   float = _DEFAULT_THESIS_MAX_NAV_PCT,
         approach_max_nav_pct: float = _DEFAULT_APPROACH_MAX_NAV_PCT,
         sentinel_max_nav_pct: float = _DEFAULT_SENTINEL_MAX_NAV_PCT,
-        sniper_max_nav_pct:   float = 0.05,
+        sniper_max_nav_pct:   float = _DEFAULT_SNIPER_MAX_NAV_PCT,
+        scanner_interval_secs: int  = 300,
         pending_max_hours:    float = 24.0,
+        entry_retry:          Optional[RetryProfile] = None,
         patient_retry:        Optional[RetryProfile] = None,
         urgent_retry:         Optional[RetryProfile] = None,
         base_currency:        str   = "CHF",
@@ -556,10 +579,14 @@ class Strategy:
         self.exit_profiles        = exit_profiles or {}
         self.contract_specs       = contract_specs or {}
         self.scanner              = sniper_scanner
+        self.thesis_max_nav_pct   = thesis_max_nav_pct
         self.approach_max_nav_pct = approach_max_nav_pct
         self.sentinel_max_nav_pct = sentinel_max_nav_pct
         self.sniper_max_nav_pct   = sniper_max_nav_pct
+        self.scanner_interval_secs = max(1, int(scanner_interval_secs))
+        self._last_scan_at: Optional[datetime] = None
         self.pending_max_hours    = pending_max_hours
+        self.entry_retry          = entry_retry or self._DEFAULT_ENTRY
         self.patient_retry        = patient_retry or self._DEFAULT_PATIENT
         self.urgent_retry         = urgent_retry  or self._DEFAULT_URGENT
         self.plays: list[Play]    = []
@@ -610,10 +637,30 @@ class Strategy:
             ctx.contract_cache[con_id] = contract
         return contract
 
+    def _pending_entry_capital(self) -> float:
+        """Premium budget reserved by live/unresolved BUY orders.
+
+        IB portfolio risk only sees filled positions. Async entry orders can
+        still fill later, so reserve their remaining premium from future
+        headroom to avoid over-committing the option sleeve.
+        """
+        total = 0.0
+        for play in self.plays:
+            we = getattr(play, "working_entry", None)
+            if we is None or we.remaining_qty <= 0:
+                continue
+            px = we.limit_px or play.entry_price
+            if px and px > 0:
+                total += float(px) * 100 * int(we.remaining_qty)
+        return total
+
+    def _available_headroom(self, ctx: StrategyContext) -> float:
+        return max(0.0, ctx.risk.headroom() - self._pending_entry_capital())
+
     def _entry_budget(self, ctx: StrategyContext, desired_capital: float) -> float:
         if desired_capital <= 0:
             return 0.0
-        caps = [desired_capital, ctx.risk.headroom()]
+        caps = [desired_capital, self._available_headroom(ctx)]
         if ctx.snapshot.cash > 0:
             caps.append(ctx.snapshot.cash)
         if ctx.snapshot.buying_power > 0:
@@ -622,7 +669,7 @@ class Strategy:
 
     def _entry_guard(self, ctx: StrategyContext, contract_currency: Optional[str] = None) -> bool:
         """Fail-closed preflight for new option entries."""
-        if not self._risk_guard(ctx.risk):
+        if not self._risk_guard(ctx):
             return False
         if self._option_market_values_missing(ctx.snapshot.positions):
             print(
@@ -630,6 +677,15 @@ class Strategy:
                 "blocking new entries until portfolio values are reliable."
             )
             return False
+        if contract_currency:
+            snapshot_currency = str(ctx.snapshot.currency or "").upper()
+            contract_currency = str(contract_currency or "").upper()
+            if snapshot_currency and contract_currency and snapshot_currency != contract_currency:
+                print(
+                    f"[STRATEGY] ⚠ Account snapshot currency is {snapshot_currency}, "
+                    f"but selected option is {contract_currency}. Sizing assumes the "
+                    "snapshot currency is already appropriate for this contract."
+                )
         return True
 
     @staticmethod
@@ -777,9 +833,7 @@ class Strategy:
         if qty < 1:
             print(f"[STRATEGY] SNIPER {symbol}: insufficient headroom")
             return None
-        result = self.executor.buy_option(
-            con_id, qty, **self.patient_retry.as_kwargs()
-        )
+        result = self._submit_entry_order(con_id, qty)
         return self._make_play(
             play_type    = PlayType.SNIPER,
             symbol       = symbol.upper(),
@@ -831,14 +885,14 @@ class Strategy:
             qty_use = min(qty, qty_algo)
         else:
             conv = conviction or ConvictionLevel.MEDIUM
-            desired = ctx.risk.headroom() * conv.value
+            desired = ctx.snapshot.nav * self.thesis_max_nav_pct * conv.value
             max_usd = self._entry_budget(ctx, desired)
             qty_algo = int(max_usd / (ref_px * 100)) if (max_usd > 0 and ref_px > 0) else 0
             qty_use = min(qty, qty_algo)
         if qty_use < 1:
             print(f"[STRATEGY] manual {sym}: insufficient headroom")
             return None
-        result = self.executor.buy_option(con_id, qty_use, **self.patient_retry.as_kwargs())
+        result = self._submit_entry_order(con_id, qty_use)
         return self._make_play(
             play_type=play_type, symbol=sym, con_id=con_id,
             qty=qty_use, entry_price=ref_px, entry_nav=ctx.snapshot.nav,
@@ -915,16 +969,24 @@ class Strategy:
     def step(self) -> None:
         ctx = self.context()
         self._monitor_plays(ctx)
-        if self.scanner:
+        if self.scanner and self._scanner_due():
+            self._last_scan_at = _market_now()
             hit = self.scanner.scan()
             if hit:
                 sym, spot = hit
                 if not self._has_open_play(sym, PlayType.SNIPER):
                     self.open_sniper(sym, spot_price=spot, ctx=self.context())
 
+    def _scanner_due(self) -> bool:
+        if self._last_scan_at is None:
+            return True
+        elapsed = (_market_now() - self._last_scan_at).total_seconds()
+        return elapsed >= self.scanner_interval_secs
+
     # ── private: risk guard ───────────────────────────────────────────────────
 
-    def _risk_guard(self, risk: PortfolioRisk) -> bool:
+    def _risk_guard(self, ctx: StrategyContext) -> bool:
+        risk = ctx.risk
         if risk.risk_status == "ABOVE_CEILING":
             print(
                 f"[STRATEGY] Ceiling breached "
@@ -932,16 +994,27 @@ class Strategy:
                 f"— no new entries"
             )
             return False
-        if risk.headroom() < 100:
-            print(f"[STRATEGY] Headroom too small (${risk.headroom():.0f})")
+        available = self._available_headroom(ctx)
+        if available < 100:
+            reserved = self._pending_entry_capital()
+            suffix = f" after reserving ${reserved:,.0f} for pending entries" if reserved > 0 else ""
+            print(f"[STRATEGY] Headroom too small (${available:.0f}{suffix})")
             return False
         return True
 
     def _retry_kind(self, profile: RetryProfile) -> str:
-        return "urgent" if profile is self.urgent_retry else "patient"
+        if profile is self.urgent_retry:
+            return "urgent"
+        if profile is self.entry_retry:
+            return "entry"
+        return "patient"
 
     def _profile_for_kind(self, retry_kind: str) -> RetryProfile:
-        return self.urgent_retry if retry_kind == "urgent" else self.patient_retry
+        if retry_kind == "urgent":
+            return self.urgent_retry
+        if retry_kind == "entry":
+            return self.entry_retry
+        return self.patient_retry
 
     def _live_qty(self, pos_row: Optional[dict]) -> int:
         return max(0, int(self._signed_position(pos_row)))
@@ -994,6 +1067,39 @@ class Strategy:
             "submitted_qty": result.qty,
         }
 
+    def _stamp_single_attempt_result(self, result: OrderResult, requested_qty: int) -> OrderResult:
+        """Populate cross-attempt fields for a non-blocking single attempt."""
+        filled = int(result.filled_qty() or 0)
+        result.total_filled = filled
+        result.total_cost = sum(
+            f.execution.shares * f.execution.price
+            for f in getattr(result.trade, "fills", [])
+        )
+        result.requested_qty = int(requested_qty)
+        result.unfilled_qty = max(0, int(requested_qty) - filled)
+        result.last_order_live = self.executor.is_live(result)
+        result.cancel_unresolved = result.last_order_live
+        return result
+
+    def _submit_entry_order(self, con_id: int, qty: int, attempt: int = 0) -> OrderResult:
+        profile = self.entry_retry
+        total_attempts = profile.max_retries + 1
+        mode = self.executor.mode_for_attempt(
+            attempt=attempt,
+            total_attempts=total_attempts,
+            mode=profile.mode,
+            fallback_mode=profile.fallback_mode,
+            fallback_after=profile.fallback_after,
+            last_resort_mode=profile.last_resort_mode,
+        )
+        result = self.executor.submit_option_order(
+            side=OrderSide.BUY,
+            con_id=con_id,
+            qty=qty,
+            mode=mode,
+        )
+        return self._stamp_single_attempt_result(result, requested_qty=qty)
+
     def _working_entry_from_result(
         self,
         result: OrderResult,
@@ -1008,7 +1114,7 @@ class Strategy:
             remaining_qty=remaining_qty,
             attempts_used=attempts_used,
             submitted_at=_market_now(),
-            retry_kind="patient",
+            retry_kind="entry",
             reason="entry",
             accounted_fills=accounted_fills,
             side=result.side.value,
@@ -1272,53 +1378,121 @@ class Strategy:
 
     def _advance_working_entries(self, ctx: StrategyContext) -> bool:
         dirty = False
+        now = _market_now()
+
+        def _apply_entry_fill(play: Play, we: WorkingEntry, delta: int, fill_px: Optional[float]) -> None:
+            old_qty = max(0, play.qty_open)
+            new_qty = old_qty + delta
+            if new_qty > 0 and fill_px and fill_px > 0:
+                play.entry_price = (
+                    ((play.entry_price * old_qty) + (float(fill_px) * delta)) / new_qty
+                    if old_qty > 0 else float(fill_px)
+                )
+            play.qty_open = new_qty
+            play.qty_initial = max(play.qty_initial + delta, new_qty)
+            play.status = PlayStatus.OPEN
+            we.remaining_qty = max(0, we.remaining_qty - delta)
+
         for play in [p for p in self.plays if p.working_entry is not None]:
             we = play.working_entry
             if we is None:
                 continue
 
-            if we.trade_result is not None:
-                trade_result = we.trade_result
-                trade_filled = trade_result.filled_qty()
-                if trade_filled > we.accounted_fills:
-                    delta = trade_filled - we.accounted_fills
-                    fill_px = trade_result.avg_fill() or trade_result.limit_px or play.entry_price
-                    old_qty = max(0, play.qty_open)
-                    new_qty = old_qty + delta
-                    if new_qty > 0 and fill_px and fill_px > 0:
-                        play.entry_price = (
-                            ((play.entry_price * old_qty) + (float(fill_px) * delta)) / new_qty
-                            if old_qty > 0 else float(fill_px)
-                        )
-                    play.qty_open = new_qty
-                    play.qty_initial = max(play.qty_initial + delta, new_qty)
-                    play.status = PlayStatus.OPEN
-                    we.accounted_fills = trade_filled
-                    we.remaining_qty = max(0, we.remaining_qty - delta)
-                    dirty = True
+            if we.trade_result is None:
+                # UNBOUND/EXHAUSTED entries remain attached intentionally; this
+                # blocks duplicate BUYs until the operator verifies the broker state.
+                continue
 
-                pos_row = ctx.position(play.con_id)
-                live_qty = self._live_qty(pos_row)
-                if live_qty > play.qty_open:
-                    delta = live_qty - play.qty_open
-                    play.qty_open = live_qty
-                    play.qty_initial = max(play.qty_initial + delta, live_qty)
-                    play.status = PlayStatus.OPEN
-                    we.remaining_qty = max(0, we.remaining_qty - delta)
-                    dirty = True
+            trade_result = we.trade_result
+            trade_filled = trade_result.filled_qty()
+            if trade_filled > we.accounted_fills:
+                delta = trade_filled - we.accounted_fills
+                fill_px = trade_result.avg_fill() or trade_result.limit_px or play.entry_price
+                _apply_entry_fill(play, we, delta, fill_px)
+                we.accounted_fills = trade_filled
+                dirty = True
 
-                if self.executor.is_live(trade_result):
-                    continue
+            pos_row = ctx.position(play.con_id)
+            live_qty = self._live_qty(pos_row)
+            if live_qty > play.qty_open:
+                delta = live_qty - play.qty_open
+                _apply_entry_fill(play, we, delta, trade_result.avg_fill() or play.entry_price)
+                dirty = True
 
-            # If the entry order is no longer live, no more entry fills should arrive.
-            if we.remaining_qty <= 0 or we.trade_result is not None:
+            if we.remaining_qty <= 0:
                 play.working_entry = None
                 if play.qty_open <= 0:
                     play.qty_open = 0
                     play.qty_initial = 0
                     play.status = PlayStatus.CLOSED
                     print(f"[STRATEGY] {play.symbol} PENDING entry ended with no fill → CLOSED")
+                else:
+                    play.status = PlayStatus.OPEN
                 dirty = True
+                continue
+
+            profile = self._profile_for_kind(we.retry_kind)
+            total_attempts = profile.max_retries + 1
+
+            if self.executor.is_live(trade_result):
+                elapsed = (now - we.submitted_at).total_seconds()
+                if elapsed >= profile.fill_timeout_secs and not we.cancel_requested:
+                    self.executor.cancel(trade_result)
+                    we.cancel_requested = True
+                    dirty = True
+                continue
+
+            if we.attempts_used >= total_attempts:
+                if play.qty_open <= 0:
+                    play.qty_open = 0
+                    play.qty_initial = 0
+                    play.status = PlayStatus.CLOSED
+                    play.working_entry = None
+                    print(
+                        f"[STRATEGY] {play.symbol} entry exhausted "
+                        f"after {total_attempts} attempts with no fill → CLOSED"
+                    )
+                else:
+                    play.working_entry = None
+                    play.status = PlayStatus.OPEN
+                    print(
+                        f"[STRATEGY] ⚠ {play.symbol} entry partially filled "
+                        f"({play.qty_open}/{we.requested_qty}); remaining entry exhausted"
+                    )
+                dirty = True
+                continue
+
+            next_attempt = we.attempts_used
+            try:
+                result = self._submit_entry_order(
+                    con_id=play.con_id,
+                    qty=we.remaining_qty,
+                    attempt=next_attempt,
+                )
+            except Exception as exc:
+                print(
+                    f"[STRATEGY] ⚠ ENTRY retry failed for {play.symbol}: {exc}. "
+                    "Automatic re-submit blocked."
+                )
+                we.status = "EXHAUSTED"
+                we.trade_result = None
+                dirty = True
+                continue
+
+            play.orders.append(result)
+            play.working_entry = self._working_entry_from_result(
+                result=result,
+                requested_qty=we.requested_qty,
+                remaining_qty=we.remaining_qty,
+                attempts_used=next_attempt + 1,
+                accounted_fills=0,
+            )
+            dirty = True
+            print(
+                f"[STRATEGY] ENTRY retry {play.symbol} "
+                f"{play.working_entry.attempts_used}/{total_attempts}  "
+                f"qty={play.working_entry.remaining_qty}  status={trade_result.status()}"
+            )
         return dirty
 
     def _advance_working_orders(self, ctx: StrategyContext) -> bool:
@@ -1504,12 +1678,12 @@ class Strategy:
         Exit decision tree (priority order).  Returns True if any state was
         mutated (caller is responsible for a single state.save).
 
-          1. DTE floor              → full close
-          2. Stop loss              → full close
-          3. Full exit target       → full close
-          4. Trailing stop          → full close
-          5. Max hold days          → full close
-          6. VELOCITY SPIKE         → aggressive partial (once only)
+          1. DTE floor              → urgent full close
+          2. Stop loss              → urgent full close
+          3. Trailing stop          → urgent full close
+          4. Max hold days          → full close
+          5. VELOCITY SPIKE         → aggressive partial (once only)
+          6. Full exit target       → full close
           7. Tranches (THESIS+APPROACH+SENTINEL)→ partial (one per cycle)
         """
         dirty = False
@@ -1572,6 +1746,7 @@ class Strategy:
                         return self._close_play(
                             play, qty,
                             f"DTE floor ({dte} ≤ {ep.dte_floor}), no price data",
+                            retry=self.urgent_retry,
                             ctx=ctx,
                         ) or dirty
                 except ValueError:
@@ -1602,7 +1777,9 @@ class Strategy:
                 dte = (exp_date - _market_date()).days
                 if dte <= ep.dte_floor:
                     return self._close_play(
-                        play, qty, f"DTE floor ({dte} ≤ {ep.dte_floor})", ctx=ctx
+                        play, qty, f"DTE floor ({dte} ≤ {ep.dte_floor})",
+                        retry=self.urgent_retry,
+                        ctx=ctx,
                     ) or dirty
             except ValueError:
                 pass
@@ -1615,17 +1792,16 @@ class Strategy:
                 ctx=ctx,
             ) or dirty
 
-        # ── 3. Full exit target ──────────────────────────────────────────
-        if pnl_pct >= ep.full_exit_pct:
-            return self._close_play(play, qty, f"full target ({pnl_pct:.1%})", ctx=ctx) or dirty
-
-        # ── 4. Trailing stop ─────────────────────────────────────────────
+        # ── 3. Trailing stop ─────────────────────────────────────────────
+        trail_activate = ep.trail_activate()
+        trail_drawdown = ep.trail_drawdown()
         if (
-            ep.trailing_stop_pct is not None
-            and play.peak_pnl_pct >= ep.trailing_stop_pct
+            trail_activate is not None
+            and trail_drawdown is not None
+            and play.peak_pnl_pct >= trail_activate
         ):
             dd = play.peak_pnl_pct - pnl_pct
-            if dd >= ep.trailing_stop_pct:
+            if dd >= trail_drawdown:
                 return self._close_play(
                     play, qty,
                     f"trailing stop (peak={play.peak_pnl_pct:.1%} "
@@ -1634,7 +1810,7 @@ class Strategy:
                     ctx=ctx,
                 ) or dirty
 
-        # ── 5. Max hold days ─────────────────────────────────────────────
+        # ── 4. Max hold days ─────────────────────────────────────────────
         if play.entry_time_known and ep.max_hold_days > 0:
             if play.hours_since_entry() / 24 >= ep.max_hold_days:
                 return self._close_play(play, qty, f"max hold ({ep.max_hold_days}d)", ctx=ctx) or dirty
@@ -1642,7 +1818,7 @@ class Strategy:
         effective_tranche_idx = self._effective_tranche_idx(play)
         effective_spike_fired = self._effective_spike_fired(play)
 
-        # ── 6. VELOCITY SPIKE EXIT ───────────────────────────────────────
+        # ── 5. VELOCITY SPIKE EXIT ───────────────────────────────────────
         if (
             play.entry_time_known
             and not effective_spike_fired
@@ -1678,6 +1854,10 @@ class Strategy:
                         reserve_spike_fired=True,
                         ctx=ctx,
                     ) or dirty
+
+        # ── 6. Full exit target ──────────────────────────────────────────
+        if pnl_pct >= ep.full_exit_pct:
+            return self._close_play(play, qty, f"full target ({pnl_pct:.1%})", ctx=ctx) or dirty
 
         # ── 7. Tranche-based scale-out ─────────────────────────────────
         if (
@@ -1819,7 +1999,7 @@ class Strategy:
         self, ctx: StrategyContext,
         conviction: ConvictionLevel, ask_price: float,
     ) -> int:
-        desired = ctx.risk.headroom() * conviction.value
+        desired = ctx.snapshot.nav * self.thesis_max_nav_pct * conviction.value
         max_usd = self._entry_budget(ctx, desired)
         if max_usd <= 0 or ask_price <= 0:
             return 0
@@ -1866,9 +2046,7 @@ class Strategy:
         if qty < 1:
             print(f"[STRATEGY] {play_type.value} {symbol.upper()}: insufficient headroom")
             return None
-        result = self.executor.buy_option(
-            con_id, qty, **self.patient_retry.as_kwargs()
-        )
+        result = self._submit_entry_order(con_id, qty)
         return self._make_play(
             play_type=play_type, symbol=symbol.upper(),
             con_id=con_id, qty=qty,

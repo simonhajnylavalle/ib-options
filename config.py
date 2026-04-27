@@ -35,18 +35,28 @@ _LEGACY_CFG_PATH = Path(__file__).resolve().parent / "config.toml"
 
 _DEFAULT_RAW: dict[str, Any] = {
     "general": {
-        "loop_interval": 300,
+        "loop_interval": 30,
+        "scanner_interval": 300,
         "risk_ceiling": 0.40,
-        "approach_max_nav_pct": 0.03,
-        "sentinel_max_nav_pct": 0.03,
-        "sniper_max_nav_pct": 0.40,
-        "base_currency": "CHF",
+        "thesis_max_nav_pct": 0.06,
+        "approach_max_nav_pct": 0.025,
+        "sentinel_max_nav_pct": 0.010,
+        "sniper_max_nav_pct": 0.010,
+        "base_currency": "USD",
         "account_id": "",
         "ib_host": "127.0.0.1",
         "ib_port": 4001,
         "ib_client_id": 1,
     },
     "execution": {
+        "entry": {
+            "fill_timeout_secs": 30,
+            "max_retries": 5,
+            "mode": "IB_MODEL",
+            "fallback_mode": "MID",
+            "fallback_after": 2,
+            "last_resort_mode": "",
+        },
         "patient": {
             "fill_timeout_secs": 60,
             "max_retries": 29,
@@ -66,81 +76,96 @@ _DEFAULT_RAW: dict[str, Any] = {
     },
     "thesis": {
         "exit": {
-            "stop_loss_pct": -0.45,
+            "stop_loss_pct": -0.40,
             "full_exit_pct": 1.50,
-            "trailing_stop_pct": 0.30,
-            "dte_floor": 5,
+            "trail_activate_pct": 0.50,
+            "trail_drawdown_pct": 0.25,
+            "dte_floor": 21,
+            "max_hold_days": 45,
             "tranches": [[0.50, 0.25], [1.00, 0.35]],
             "spike_pct": 1.00,
             "spike_window_hours": 6.0,
             "spike_sell_ratio": 0.50,
         },
         "contract": {
-            "delta_min": 0.40,
-            "delta_max": 0.55,
-            "dte_min": 25,
-            "dte_max": 50,
+            "delta_min": 0.45,
+            "delta_max": 0.65,
+            "dte_min": 45,
+            "dte_max": 90,
             "strike_width": 0.25,
+            "max_spread_pct": 15.0,
+            "min_open_interest": 100,
+            "min_volume": 10,
         },
     },
     "approach": {
         "exit": {
-            "stop_loss_pct": -0.35,
+            "stop_loss_pct": -0.30,
             "full_exit_pct": 0.60,
-            "trailing_stop_pct": 0.20,
-            "dte_floor": 8,
-            "tranches": [[0.15, 0.30], [0.30, 0.40]],
-            "spike_pct": 0.80,
+            "trail_activate_pct": 0.25,
+            "trail_drawdown_pct": 0.20,
+            "dte_floor": 12,
+            "max_hold_days": 20,
+            "tranches": [[0.20, 0.30], [0.40, 0.40]],
+            "spike_pct": 0.45,
             "spike_window_hours": 4.0,
-            "spike_sell_ratio": 0.60,
+            "spike_sell_ratio": 0.50,
         },
         "contract": {
-            "delta_min": 0.30,
-            "delta_max": 0.45,
-            "dte_min": 25,
+            "delta_min": 0.35,
+            "delta_max": 0.50,
+            "dte_min": 21,
             "dte_max": 45,
             "strike_width": 0.20,
+            "max_spread_pct": 15.0,
+            "min_open_interest": 100,
+            "min_volume": 10,
         },
     },
     "sentinel": {
         "exit": {
             "stop_loss_pct": -0.50,
-            "full_exit_pct": 1.00,
-            "trailing_stop_pct": 0.25,
-            "dte_floor": 15,
-            "tranches": [[0.30, 0.30], [0.60, 0.40]],
-            "spike_pct": 1.00,
+            "full_exit_pct": 1.50,
+            "trail_activate_pct": 0.75,
+            "trail_drawdown_pct": 0.35,
+            "dte_floor": 45,
+            "max_hold_days": 90,
+            "tranches": [[0.50, 0.25], [1.00, 0.35]],
+            "spike_pct": 0.75,
             "spike_window_hours": 6.0,
             "spike_sell_ratio": 0.50,
         },
         "contract": {
             "delta_min": 0.15,
             "delta_max": 0.30,
-            "dte_min": 60,
-            "dte_max": 120,
-            "strike_width": 0.30,
-            "max_spread_pct": 25.0,
-            "min_open_interest": 10,
+            "dte_min": 90,
+            "dte_max": 180,
+            "strike_width": 0.35,
+            "max_spread_pct": 20.0,
+            "min_open_interest": 50,
             "min_volume": 1,
         },
     },
     "sniper": {
         "exit": {
-            "stop_loss_pct": -0.50,
-            "full_exit_pct": 1.00,
-            "max_hold_days": 7,
-            "dte_floor": 1,
+            "stop_loss_pct": -0.30,
+            "full_exit_pct": 0.60,
+            "max_hold_days": 2,
+            "dte_floor": 3,
         },
         "contract": {
-            "delta_min": 0.35,
-            "delta_max": 0.55,
-            "dte_min": 2,
-            "dte_max": 14,
-            "strike_width": 0.20,
+            "delta_min": 0.45,
+            "delta_max": 0.65,
+            "dte_min": 7,
+            "dte_max": 21,
+            "strike_width": 0.15,
+            "max_spread_pct": 12.0,
+            "min_open_interest": 100,
+            "min_volume": 20,
         },
         "scanner": {
             "watchlist": ["BNTX", "NVAX", "MRNA", "REGN"],
-            "drop_pct": 0.15,
+            "drop_pct": 0.12,
         },
     },
 }
@@ -157,12 +182,14 @@ _DEFAULT_CONFIG_TEXT = """# ─────────────────�
 # ─────────────────────────────────────────────────────────────────────────────
 
 [general]
-loop_interval        = 300      # seconds between strategy ticks
-risk_ceiling         = 0.40     # max options notional / NAV
-approach_max_nav_pct = 0.03     # hard cap for APPROACH sizing
-sentinel_max_nav_pct = 0.03     # hard cap for SENTINEL sizing
-sniper_max_nav_pct   = 0.40     # hard cap for SNIPER sizing (% of NAV)
-base_currency        = "CHF"    # preferred IB account-summary currency; BASE/USD fallback is automatic
+loop_interval        = 30       # seconds between risk/exit-monitoring ticks
+scanner_interval     = 300      # seconds between SNIPER scanner sweeps
+risk_ceiling         = 0.40     # max options notional / NAV; intentionally unchanged
+thesis_max_nav_pct   = 0.06     # high-conviction THESIS cap; conviction scales below this
+approach_max_nav_pct = 0.025    # hard cap for APPROACH sizing
+sentinel_max_nav_pct = 0.010    # hard cap for SENTINEL sizing
+sniper_max_nav_pct   = 0.010    # hard cap for SNIPER sizing (% of NAV)
+base_currency        = "USD"    # preferred sizing/account-summary currency for US options
 account_id           = ""       # optional IB account code; blank = auto-select
 ib_host              = "127.0.0.1"
 ib_port              = 4001
@@ -172,117 +199,141 @@ ib_client_id         = 1
 # ── EXECUTION ─────────────────────────────────────────────────────────────────
 # Retry and pricing behaviour for order placement.
 #
-# Two profiles: "patient" (entries, profit-taking, DTE floor, max hold)
-#               "urgent"  (stop loss, trailing stop)
+# Three profiles:
+#   "entry"   — opening buys; deliberately short so entries cannot freeze monitoring
+#   "patient" — profit-taking / non-urgent exits; non-blocking in strategy.py
+#   "urgent"  — stop loss, trailing stop, DTE floor; non-blocking in strategy.py
 #
 # Mode ladder: start at `mode`, switch to `fallback_mode` after
 # `fallback_after` attempts, optionally use `last_resort_mode` on the
 # final attempt only (set to "" to disable). Set fallback_mode="" to disable
 # fallback-mode switching entirely.
 
+[execution.entry]
+fill_timeout_secs = 30        # seconds per async entry attempt
+max_retries       = 5         # total attempts = 6 (~3 min max, non-blocking)
+mode              = "IB_MODEL"
+fallback_mode     = "MID"
+fallback_after    = 2         # first 2 attempts IB_MODEL, rest MID
+last_resort_mode  = ""        # no NATURAL on entries
+
 [execution.patient]
-fill_timeout_secs = 60        # seconds per attempt
-max_retries       = 29        # total attempts = 30  (~30 min)
+fill_timeout_secs = 60        # seconds per async exit attempt
+max_retries       = 29        # total attempts = 30 (~30 min, non-blocking)
 mode              = "IB_MODEL"
 fallback_mode     = "MID"
 fallback_after    = 10        # first 10 attempts IB_MODEL, rest MID
-last_resort_mode  = ""        # no NATURAL ever
+last_resort_mode  = ""        # no NATURAL for patient profit-taking exits
 
 [execution.urgent]
-fill_timeout_secs = 60        # seconds per attempt
-max_retries       = 7         # total attempts = 8   (~8 min)
+fill_timeout_secs = 60        # seconds per async exit attempt
+max_retries       = 7         # total attempts = 8 (~8 min, non-blocking)
 mode              = "IB_MODEL"
 fallback_mode     = "MID"
 fallback_after    = 3         # first 3 attempts IB_MODEL, rest MID
-last_resort_mode  = "NATURAL" # NATURAL on final attempt only (stop loss)
+last_resort_mode  = "NATURAL" # NATURAL on final attempt only
 
 
 # ── THESIS ──────────────────────────────────────────────────────────────────
 
 [thesis.exit]
-stop_loss_pct      = -0.45
-full_exit_pct      =  1.50
-trailing_stop_pct  =  0.30
-dte_floor          =  5
-tranches           = [[0.50, 0.25], [1.00, 0.35]]
+stop_loss_pct        = -0.40
+full_exit_pct        =  1.50
+trail_activate_pct   =  0.50
+trail_drawdown_pct   =  0.25
+dte_floor            =  21
+max_hold_days        =  45
+tranches             = [[0.50, 0.25], [1.00, 0.35]]
 # velocity spike
-spike_pct          =  1.00
-spike_window_hours =  6.0
-spike_sell_ratio   =  0.50
+spike_pct            =  1.00
+spike_window_hours   =  6.0
+spike_sell_ratio     =  0.50
 
 [thesis.contract]
-delta_min    = 0.40
-delta_max    = 0.55
-dte_min      = 25
-dte_max      = 50
-strike_width = 0.25
+delta_min         = 0.45
+delta_max         = 0.65
+dte_min           = 45
+dte_max           = 90
+strike_width      = 0.25
+max_spread_pct    = 15.0
+min_open_interest = 100
+min_volume        = 10
 
 
 # ── APPROACH ────────────────────────────────────────────────────────────────
 
 [approach.exit]
-stop_loss_pct      = -0.35
-full_exit_pct      =  0.60
-trailing_stop_pct  =  0.20
-dte_floor          =  8
-tranches           = [[0.15, 0.30], [0.30, 0.40]]
+stop_loss_pct        = -0.30
+full_exit_pct        =  0.60
+trail_activate_pct   =  0.25
+trail_drawdown_pct   =  0.20
+dte_floor            =  12
+max_hold_days        =  20
+tranches             = [[0.20, 0.30], [0.40, 0.40]]
 # velocity spike
-spike_pct          =  0.80
-spike_window_hours =  4.0
-spike_sell_ratio   =  0.60
+spike_pct            =  0.45
+spike_window_hours   =  4.0
+spike_sell_ratio     =  0.50
 
 [approach.contract]
-delta_min    = 0.30
-delta_max    = 0.45
-dte_min      = 25
-dte_max      = 45
-strike_width = 0.20
+delta_min         = 0.35
+delta_max         = 0.50
+dte_min           = 21
+dte_max           = 45
+strike_width      = 0.20
+max_spread_pct    = 15.0
+min_open_interest = 100
+min_volume        = 10
 
 
 # ── SENTINEL ────────────────────────────────────────────────────────────────
 
 [sentinel.exit]
-stop_loss_pct      = -0.50
-full_exit_pct      =  1.00
-trailing_stop_pct  =  0.25
-dte_floor          =  15
-tranches           = [[0.30, 0.30], [0.60, 0.40]]
+stop_loss_pct        = -0.50
+full_exit_pct        =  1.50
+trail_activate_pct   =  0.75
+trail_drawdown_pct   =  0.35
+dte_floor            =  45
+max_hold_days        =  90
+tranches             = [[0.50, 0.25], [1.00, 0.35]]
 # velocity spike
-spike_pct          =  1.00
-spike_window_hours =  6.0
-spike_sell_ratio   =  0.50
+spike_pct            =  0.75
+spike_window_hours   =  6.0
+spike_sell_ratio     =  0.50
 
 [sentinel.contract]
 delta_min         = 0.15
 delta_max         = 0.30
-dte_min           = 60
-dte_max           = 120
-strike_width      = 0.30
-max_spread_pct    = 25.0      # relaxed for illiquid biotech
-min_open_interest = 10
+dte_min           = 90
+dte_max           = 180
+strike_width      = 0.35
+max_spread_pct    = 20.0      # still ranked softly, not hard-filtered
+min_open_interest = 50
 min_volume        = 1
 
 
 # ── SNIPER ──────────────────────────────────────────────────────────────────
 
 [sniper.exit]
-stop_loss_pct = -0.50
-full_exit_pct =  1.00
-max_hold_days =  7
-dte_floor     =  1
+stop_loss_pct = -0.30
+full_exit_pct =  0.60
+max_hold_days =  2
+dte_floor     =  3
 
 [sniper.contract]
-delta_min    = 0.35
-delta_max    = 0.55
-dte_min      = 2
-dte_max      = 14
-strike_width = 0.20
+delta_min         = 0.45
+delta_max         = 0.65
+dte_min           = 7
+dte_max           = 21
+strike_width      = 0.15
+max_spread_pct    = 12.0
+min_open_interest = 100
+min_volume        = 20
 
 [sniper.scanner]
 watchlist = ["BNTX", "NVAX", "MRNA", "REGN"]
-drop_pct  = 0.15
+drop_pct  = 0.12
 """
-
 
 @dataclass
 class Config:
@@ -290,7 +341,9 @@ class Config:
 
     # general
     loop_interval:        int
+    scanner_interval:     int
     risk_ceiling:         float
+    thesis_max_nav_pct:   float
     approach_max_nav_pct: float
     sentinel_max_nav_pct: float
     sniper_max_nav_pct:   float
@@ -305,6 +358,7 @@ class Config:
     contract_specs: dict[str, ContractSpec]
 
     # execution
+    entry:   RetryProfile
     patient: RetryProfile
     urgent:  RetryProfile
 
@@ -410,21 +464,24 @@ def load(path: Path | None = None) -> Config:
     exec_raw = raw.get("execution", {})
 
     return Config(
-        loop_interval=int(gen.get("loop_interval", 300)),
+        loop_interval=int(gen.get("loop_interval", 30)),
+        scanner_interval=int(gen.get("scanner_interval", 300)),
         risk_ceiling=float(gen.get("risk_ceiling", 0.40)),
-        approach_max_nav_pct=float(gen.get("approach_max_nav_pct", 0.03)),
-        sentinel_max_nav_pct=float(gen.get("sentinel_max_nav_pct", 0.03)),
-        sniper_max_nav_pct=float(gen.get("sniper_max_nav_pct", 0.05)),
-        base_currency=str(gen.get("base_currency", "CHF")),
+        thesis_max_nav_pct=float(gen.get("thesis_max_nav_pct", 0.06)),
+        approach_max_nav_pct=float(gen.get("approach_max_nav_pct", 0.025)),
+        sentinel_max_nav_pct=float(gen.get("sentinel_max_nav_pct", 0.010)),
+        sniper_max_nav_pct=float(gen.get("sniper_max_nav_pct", 0.010)),
+        base_currency=str(gen.get("base_currency", "USD")),
         account_id=str(gen.get("account_id", "")),
         ib_host=str(gen.get("ib_host", "127.0.0.1")),
         ib_port=int(gen.get("ib_port", 4001)),
         ib_client_id=int(gen.get("ib_client_id", 1)),
         exit_profiles=exit_profiles,
         contract_specs=contract_specs,
+        entry=_retry_profile(exec_raw.get("entry", {})),
         patient=_retry_profile(exec_raw.get("patient", {})),
         urgent=_retry_profile(exec_raw.get("urgent", {})),
         sniper_watchlist=list(scanner.get("watchlist", ["BNTX", "NVAX", "MRNA", "REGN"])),
-        sniper_drop_pct=float(scanner.get("drop_pct", 0.15)),
+        sniper_drop_pct=float(scanner.get("drop_pct", 0.12)),
         path=resolved,
     )

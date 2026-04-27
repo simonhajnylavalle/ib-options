@@ -195,16 +195,19 @@ class OrderResult:
         return self.trade.orderStatus.status == "Filled"
 
     def filled_qty(self) -> int:
-        return int(sum(f.execution.shares for f in self.trade.fills))
+        fill_qty = int(sum(f.execution.shares for f in self.trade.fills))
+        status_qty = int(getattr(self.trade.orderStatus, "filled", 0) or 0)
+        return max(fill_qty, status_qty)
 
     def avg_fill(self) -> Optional[float]:
         """Volume-weighted average fill price. None if no fills yet."""
         fills = self.trade.fills
-        if not fills:
-            return None
-        total_qty = sum(f.execution.shares for f in fills)
-        total_val = sum(f.execution.shares * f.execution.price for f in fills)
-        return round(total_val / total_qty, 4) if total_qty else None
+        if fills:
+            total_qty = sum(f.execution.shares for f in fills)
+            total_val = sum(f.execution.shares * f.execution.price for f in fills)
+            return round(total_val / total_qty, 4) if total_qty else None
+        status_avg = float(getattr(self.trade.orderStatus, "avgFillPrice", 0) or 0)
+        return round(status_avg, 4) if status_avg > 0 else None
 
     def total_avg_fill(self) -> Optional[float]:
         """Volume-weighted avg fill price across ALL retry attempts.
