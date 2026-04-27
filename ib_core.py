@@ -75,6 +75,8 @@ class OptionChain:
         dte_min: Optional[int] = None,
         dte_max: Optional[int] = None,
         spot_price: Optional[float] = None,
+        delta_min: Optional[float] = None,
+        delta_max: Optional[float] = None,
     ) -> pd.DataFrame:
         """Return one row per qualified option contract."""
 
@@ -123,15 +125,36 @@ class OptionChain:
             for right in rights_to_fetch
         ]
         if len(contracts) > self._MAX_CONTRACTS:
-            contracts = sorted(
-                contracts,
-                key=lambda c: (
-                    abs(float(c.strike) - self.spot),
+            # Pacing trim happens before greeks are known.  Keep the old
+            # nearest-spot behaviour for normal delta ranges, but also preserve
+            # a rough OTM target band for low-delta call searches (SENTINEL), so
+            # low-delta candidates are not accidentally excluded before ranking.
+            target_strikes = [self.spot]
+            rights_set = set(rights_to_fetch)
+            if (
+                Right.CALL.value in rights_set
+                and delta_max is not None
+                and delta_max <= 0.30
+            ):
+                otm_offset = min(max(strike_width * 0.50, 0.05), 0.20)
+                target_strikes.append(self.spot * (1 + otm_offset))
+
+            def _trim_key(c):
+                strike = float(c.strike)
+                nearest_target = min(abs(strike - target) for target in target_strikes)
+                return (
+                    nearest_target,
+                    abs(strike - self.spot),
                     c.lastTradeDateOrContractMonth,
                     c.right,
-                ),
-            )[: self._MAX_CONTRACTS]
-            print(f"  trimmed to {len(contracts)} contracts nearest spot for pacing safety")
+                )
+
+            contracts = sorted(contracts, key=_trim_key)[: self._MAX_CONTRACTS]
+            targets = ", ".join(f"${t:.2f}" for t in target_strikes)
+            print(
+                f"  trimmed to {len(contracts)} contracts for pacing safety "
+                f"(target strike bands: {targets})"
+            )
 
         ib_log = logging.getLogger("ib_insync")
         previous_level = ib_log.level
@@ -250,6 +273,8 @@ class OptionChain:
             expiry_count=expiry_count,
             rights=rights,
             spot_price=spot_price,
+            delta_min=delta_min,
+            delta_max=delta_max,
         )
         if df.empty:
             return df
@@ -441,13 +466,16 @@ class Account:
 
     def _currency_priority(self) -> list[str]:
         out = []
-        for currency in ("BASE", self._base_currency.upper(), "USD"):
+        for currency in (self._base_currency.upper(), "BASE", "USD"):
             if currency and currency not in out:
                 out.append(currency)
         return out
 
     def _display_currency(self, currency: str) -> str:
-        return self._base_currency if currency == "BASE" else currency
+        # IB's "BASE" bucket means the account's true base currency, which is
+        # not necessarily the configured preferred sizing currency. Keep it
+        # explicit instead of relabeling it incorrectly.
+        return "BASE" if currency == "BASE" else currency
 
     def _account_values(self) -> tuple[dict, str]:
         """

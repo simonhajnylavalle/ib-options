@@ -144,12 +144,17 @@ def do_status(strat: Strategy, ib, args: list[str]):
     parts = [f"{active} active"]
     if pending:
         parts.append(f"{pending} pending")
-    rsk = _kvtable(
+    pending_reserved = strat._pending_entry_capital()
+    available_headroom = max(0.0, risk.headroom() - pending_reserved)
+    rsk_rows = [
         ("Risk ceiling", f"{strat.policy.risk_ceiling:.0%}  {tag}"),
         ("Headroom",     _ds(risk.headroom())),
-        ("Plays",        f"{', '.join(parts)}, {len(strat.plays)} total"),
-        title="Risk",
-    )
+    ]
+    if pending_reserved > 0:
+        rsk_rows.append(("Reserved entries", _ds(pending_reserved)))
+        rsk_rows.append(("Avail. headroom", _ds(available_headroom)))
+    rsk_rows.append(("Plays", f"{', '.join(parts)}, {len(strat.plays)} total"))
+    rsk = _kvtable(*rsk_rows, title="Risk")
     top.add_row(bal, rsk)
 
     # ── exposures table ──
@@ -293,8 +298,10 @@ def _play_detail(strat: Strategy, args: list[str]):
         ("Stop loss", f"{ep.stop_loss_pct:+.0%}"),
         ("Full exit", f"{ep.full_exit_pct:+.0%}"),
     ]
-    if ep.trailing_stop_pct is not None:
-        exit_rows.append(("Trail stop", f"{ep.trailing_stop_pct:.0%} from peak"))
+    trail_activate = ep.trail_activate()
+    trail_drawdown = ep.trail_drawdown()
+    if trail_activate is not None and trail_drawdown is not None:
+        exit_rows.append(("Trail stop", f"activate {trail_activate:.0%}, drawdown {trail_drawdown:.0%}"))
     if ep.spike_pct > 0:
         exit_rows.append(("Spike", f"+{ep.spike_pct:.0%} in <{ep.spike_window_hours:.0f}h "
                                    f"→ sell {ep.spike_sell_ratio:.0%}"))
@@ -351,10 +358,14 @@ def do_cfg(strat: Strategy, ib, args: list[str]):
     # ── general ──
     gen = _kvtable(
         ("Config path",        str(CFG.path)),
-        ("Loop interval",      f"{CFG.loop_interval}s"),
+        ("Risk loop",          f"{CFG.loop_interval}s"),
+        ("Scanner interval",   f"{CFG.scanner_interval}s"),
         ("Risk ceiling",       f"{CFG.risk_ceiling:.0%}"),
+        ("Thesis max NAV",     f"{CFG.thesis_max_nav_pct:.1%}"),
         ("Approach max NAV",   f"{CFG.approach_max_nav_pct:.1%}"),
         ("Sentinel max NAV",   f"{CFG.sentinel_max_nav_pct:.1%}"),
+        ("Sniper max NAV",     f"{CFG.sniper_max_nav_pct:.1%}"),
+        ("Base currency",      CFG.base_currency),
         ("IB",                 f"{CFG.ib_host}:{CFG.ib_port}  clientId={CFG.ib_client_id}"),
         title="General",
     )
@@ -371,9 +382,11 @@ def do_cfg(strat: Strategy, ib, args: list[str]):
         return f"+{ep_.spike_pct:.0%} <{ep_.spike_window_hours:.0f}h → {ep_.spike_sell_ratio:.0%}"
 
     def _trail_str(ep_):
-        if ep_.trailing_stop_pct is None:
+        activate = ep_.trail_activate()
+        drawdown = ep_.trail_drawdown()
+        if activate is None or drawdown is None:
             return "─"
-        return f"{ep_.trailing_stop_pct:.0%} from peak"
+        return f"act {activate:.0%}, dd {drawdown:.0%}"
 
     exits = Table(box=None, padding=(0, 1), title="Exit Rules",
                   title_style="bold")
@@ -442,12 +455,14 @@ def do_cfg(strat: Strategy, ib, args: list[str]):
                 f"(after {after}), last={lr}",
                 f"{total} × {rp.fill_timeout_secs}s  (~{mins:.0f} min)")
 
+    e_modes, e_timing = _retry_row(CFG.entry)
     p_modes, p_timing = _retry_row(CFG.patient)
     u_modes, u_timing = _retry_row(CFG.urgent)
 
     ex_t = _kvtable(
-        ("Patient (entries, profit)",  f"{p_modes}  {p_timing}"),
-        ("Urgent  (stop, trail)",      f"{u_modes}  {u_timing}"),
+        ("Entry   (opening buys)",     f"{e_modes}  {e_timing}"),
+        ("Patient (profit exits)",     f"{p_modes}  {p_timing}"),
+        ("Urgent  (stop/trail/DTE)",   f"{u_modes}  {u_timing}"),
         title="Execution",
     )
 
@@ -961,9 +976,12 @@ def main():
         exit_profiles        = CFG.exit_profiles,
         contract_specs       = CFG.contract_specs,
         sniper_scanner       = scanner,
+        thesis_max_nav_pct   = CFG.thesis_max_nav_pct,
         approach_max_nav_pct = CFG.approach_max_nav_pct,
         sentinel_max_nav_pct = CFG.sentinel_max_nav_pct,
         sniper_max_nav_pct   = CFG.sniper_max_nav_pct,
+        scanner_interval_secs = CFG.scanner_interval,
+        entry_retry          = CFG.entry,
         patient_retry        = CFG.patient,
         urgent_retry         = CFG.urgent,
         base_currency        = CFG.base_currency,
@@ -974,7 +992,10 @@ def main():
         strat.account.snapshot().positions,
         account_id=strat.account.account_id,
     )
-    if strat.restore_working_orders(strat.context()):
+    startup_ctx = strat.context()
+    startup_dirty = strat.restore_working_entries(startup_ctx)
+    startup_dirty |= strat.restore_working_orders(startup_ctx)
+    if startup_dirty:
         state.save(strat.plays, account_id=strat.account.account_id)
 
     stop = threading.Event()
@@ -988,7 +1009,7 @@ def main():
         print("[console] stdin is not interactive; command console disabled.")
 
     hint = "Type 'help' for commands." if console_enabled else "Running headless."
-    print(f"\nReady  (loop every {CFG.loop_interval}s).  {hint}\n")
+    print(f"\nReady  (risk loop every {CFG.loop_interval}s; scanner every {CFG.scanner_interval}s).  {hint}\n")
 
     try:
         strat.step()
@@ -1023,7 +1044,10 @@ def main():
                     time.sleep(min(5 * attempt, 30))
                     ib.disconnect()
                     ib.connect(CFG.ib_host, CFG.ib_port, clientId=CFG.ib_client_id)
-                    if strat.restore_working_orders(strat.context()):
+                    reconnect_ctx = strat.context()
+                    reconnect_dirty = strat.restore_working_entries(reconnect_ctx)
+                    reconnect_dirty |= strat.restore_working_orders(reconnect_ctx)
+                    if reconnect_dirty:
                         state.save(strat.plays, account_id=strat.account.account_id)
                     print(f"  [loop] Reconnected on attempt {attempt}")
                     break

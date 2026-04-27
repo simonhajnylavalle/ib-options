@@ -83,7 +83,11 @@ drop_pct = 0.20
     assert cfg.patient.fallback_after is None
     assert cfg.urgent.fallback_mode is None
     assert cfg.urgent.last_resort_mode is None
-    assert cfg.exit_profiles["THESIS"].dte_floor == 5
+    assert cfg.loop_interval == 30
+    assert cfg.scanner_interval == 300
+    assert cfg.thesis_max_nav_pct == 0.06
+    assert cfg.entry.fallback_mode.name == "MID"
+    assert cfg.exit_profiles["THESIS"].dte_floor == 21
     assert cfg.contract_specs["SENTINEL"].min_volume == 1
     assert cfg.sniper_drop_pct == 0.20
 
@@ -769,4 +773,4 @@ def test_pending_entry_accounts_late_fill_from_live_last_order(monkeypatch):
 
     assert dirty is True
     assert play.qty_open == 2
-    assert play.working_entry.remaining_qty == 0
+    assert play.working_entry is None
