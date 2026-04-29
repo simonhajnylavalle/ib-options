@@ -13,15 +13,24 @@
 loop_interval        = 30       # seconds between risk/exit-monitoring ticks
 scanner_interval     = 300      # seconds between SNIPER scanner sweeps
 risk_ceiling         = 0.40     # max options notional / NAV; intentionally unchanged
-thesis_max_nav_pct   = 0.06     # high-conviction THESIS cap; conviction scales below this
-approach_max_nav_pct = 0.025    # hard cap for APPROACH sizing
-sentinel_max_nav_pct = 0.010    # hard cap for SENTINEL sizing
-sniper_max_nav_pct   = 0.010    # hard cap for SNIPER sizing (% of NAV)
+thesis_max_nav_pct   = 0.4     # high-conviction THESIS cap; conviction scales below this
+approach_max_nav_pct = 0.3    # hard cap for APPROACH sizing
+sentinel_max_nav_pct = 0.20    # hard cap for SENTINEL sizing
+sniper_max_nav_pct   = 0.20    # hard cap for SNIPER sizing (% of NAV)
 base_currency        = "USD"    # preferred sizing/account-summary currency for US options
 account_id           = ""       # optional IB account code; blank = auto-select
 ib_host              = "127.0.0.1"
 ib_port              = 4001
 ib_client_id         = 1
+
+
+# ── TERMINAL ─────────────────────────────────────────────────────────────────
+# Confirmations are implemented as an explicit --yes re-run so the existing
+# input thread never races an interactive y/N prompt.
+[terminal]
+confirm_orders     = true
+confirm_cancel_all = true
+show_tracebacks    = false
 
 
 # ── EXECUTION ─────────────────────────────────────────────────────────────────
@@ -80,8 +89,8 @@ spike_sell_ratio     =  0.50
 [thesis.contract]
 delta_min         = 0.45
 delta_max         = 0.65
-dte_min           = 45
-dte_max           = 90
+dte_min           = 60
+dte_max           = 120
 strike_width      = 0.25
 max_spread_pct    = 15.0
 min_open_interest = 100
@@ -161,3 +170,4 @@ min_volume        = 20
 [sniper.scanner]
 watchlist = ["BNTX", "NVAX", "MRNA", "REGN"]
 drop_pct  = 0.12
+auto_open = false     # false = scan alerts only; true = strategy loop may auto-open SNIPER

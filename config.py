@@ -48,6 +48,11 @@ _DEFAULT_RAW: dict[str, Any] = {
         "ib_port": 4001,
         "ib_client_id": 1,
     },
+    "terminal": {
+        "confirm_orders": True,
+        "confirm_cancel_all": True,
+        "show_tracebacks": False,
+    },
     "execution": {
         "entry": {
             "fill_timeout_secs": 30,
@@ -166,6 +171,7 @@ _DEFAULT_RAW: dict[str, Any] = {
         "scanner": {
             "watchlist": ["BNTX", "NVAX", "MRNA", "REGN"],
             "drop_pct": 0.12,
+            "auto_open": False,
         },
     },
 }
@@ -194,6 +200,15 @@ account_id           = ""       # optional IB account code; blank = auto-select
 ib_host              = "127.0.0.1"
 ib_port              = 4001
 ib_client_id         = 1
+
+
+# ── TERMINAL ─────────────────────────────────────────────────────────────────
+# Confirmations are implemented as an explicit --yes re-run so the existing
+# input thread never races an interactive y/N prompt.
+[terminal]
+confirm_orders     = true
+confirm_cancel_all = true
+show_tracebacks    = false
 
 
 # ── EXECUTION ─────────────────────────────────────────────────────────────────
@@ -333,7 +348,15 @@ min_volume        = 20
 [sniper.scanner]
 watchlist = ["BNTX", "NVAX", "MRNA", "REGN"]
 drop_pct  = 0.12
+auto_open = false     # false = scan alerts only; true = strategy loop may auto-open SNIPER
 """
+
+@dataclass
+class TerminalConfig:
+    confirm_orders: bool = True
+    confirm_cancel_all: bool = True
+    show_tracebacks: bool = False
+
 
 @dataclass
 class Config:
@@ -353,6 +376,9 @@ class Config:
     ib_port:              int
     ib_client_id:         int
 
+    # terminal/operator safety
+    terminal:             TerminalConfig
+
     # per-play-type (keyed by "THESIS", "APPROACH", etc.)
     exit_profiles:  dict[str, ExitProfile]
     contract_specs: dict[str, ContractSpec]
@@ -365,6 +391,7 @@ class Config:
     # sniper scanner
     sniper_watchlist: list[str]
     sniper_drop_pct:  float
+    sniper_scanner_auto_open: bool
 
     # provenance
     path: Path
@@ -462,6 +489,7 @@ def load(path: Path | None = None) -> Config:
         )
 
     exec_raw = raw.get("execution", {})
+    terminal_raw = raw.get("terminal", {})
 
     return Config(
         loop_interval=int(gen.get("loop_interval", 30)),
@@ -476,6 +504,11 @@ def load(path: Path | None = None) -> Config:
         ib_host=str(gen.get("ib_host", "127.0.0.1")),
         ib_port=int(gen.get("ib_port", 4001)),
         ib_client_id=int(gen.get("ib_client_id", 1)),
+        terminal=TerminalConfig(
+            confirm_orders=bool(terminal_raw.get("confirm_orders", True)),
+            confirm_cancel_all=bool(terminal_raw.get("confirm_cancel_all", True)),
+            show_tracebacks=bool(terminal_raw.get("show_tracebacks", False)),
+        ),
         exit_profiles=exit_profiles,
         contract_specs=contract_specs,
         entry=_retry_profile(exec_raw.get("entry", {})),
@@ -483,5 +516,6 @@ def load(path: Path | None = None) -> Config:
         urgent=_retry_profile(exec_raw.get("urgent", {})),
         sniper_watchlist=list(scanner.get("watchlist", ["BNTX", "NVAX", "MRNA", "REGN"])),
         sniper_drop_pct=float(scanner.get("drop_pct", 0.12)),
+        sniper_scanner_auto_open=bool(scanner.get("auto_open", False)),
         path=resolved,
     )

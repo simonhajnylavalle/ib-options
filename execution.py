@@ -479,20 +479,57 @@ class Executor:
         filled = sum(f.execution.shares for f in getattr(trade, "fills", []))
         return max(0, int(getattr(trade.order, "totalQuantity", 0) - filled))
 
+    @staticmethod
+    def _trade_key(trade: Trade) -> tuple[int, int, int, str]:
+        """Stable-ish key for de-duplicating open-order snapshots."""
+        contract = getattr(trade, "contract", None)
+        order = getattr(trade, "order", None)
+        return (
+            int(getattr(order, "permId", 0) or 0),
+            int(getattr(order, "orderId", 0) or 0),
+            int(getattr(contract, "conId", 0) or 0),
+            str(getattr(order, "action", "")).upper(),
+        )
+
     def live_trades(
         self,
         con_id: Optional[int] = None,
         side: Optional[OrderSide] = None,
+        broad: bool = False,
     ) -> list[Trade]:
-        """Return currently live trades, optionally filtered by con_id and side."""
+        """Return currently live trades, optionally filtered by con_id and side.
+
+        ``broad=True`` first asks IB for the widest open-order view available
+        (``reqAllOpenOrders``), then folds in normal client open trades. This
+        mode is used by operator recovery commands before clearing local
+        duplicate-order guards. Failures are not swallowed in broad mode.
+        """
+        sources: list[Trade] = []
+
+        if broad and hasattr(self.ib, "reqAllOpenOrders"):
+            result = self.ib.reqAllOpenOrders()
+            if result:
+                sources.extend(result)
+
         if hasattr(self.ib, "reqOpenOrders"):
             try:
-                self.ib.reqOpenOrders()
+                result = self.ib.reqOpenOrders()
+                if result:
+                    sources.extend(result)
             except Exception:
-                pass
-        source = self.ib.openTrades() if hasattr(self.ib, "openTrades") else self.ib.trades()
+                if broad:
+                    raise
+
+        if hasattr(self.ib, "openTrades"):
+            sources.extend(self.ib.openTrades())
+        elif hasattr(self.ib, "trades"):
+            sources.extend(self.ib.trades())
+
+        # ``trades()`` can include completed/cancelled historical trade objects;
+        # only retain live/open statuses and remove duplicates across sources.
         out: list[Trade] = []
-        for trade in source:
+        seen: set[tuple[int, int, int, str]] = set()
+        for trade in sources:
             status = str(getattr(trade.orderStatus, "status", ""))
             if status not in _PENDING_STATUSES:
                 continue
@@ -501,6 +538,10 @@ class Executor:
             action = str(getattr(trade.order, "action", "")).upper()
             if side is not None and action != side.value:
                 continue
+            key = self._trade_key(trade)
+            if key in seen:
+                continue
+            seen.add(key)
             out.append(trade)
         return out
 

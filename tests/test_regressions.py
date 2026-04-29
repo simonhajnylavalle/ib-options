@@ -661,6 +661,43 @@ def test_account_snapshot_prefers_complete_summary_over_configured_partial_rows(
     assert snapshot.buying_power == 30_000.0
 
 
+def test_portfolio_risk_uses_broker_cash_not_nav_residual():
+    import ib_core
+    import portfolio
+
+    positions = _positions_df(
+        {
+            "account": "ACC",
+            "symbol": "NTLA",
+            "con_id": 1,
+            "sec_type": "OPT",
+            "position": 1,
+            "market_value": 394.13,
+            "avg_cost": 396.18,
+            "unrealized_pnl": -2.05,
+        }
+    )
+    snapshot = ib_core.AccountSnapshot(
+        account_id="ACC",
+        nav=508.17,
+        cash=196.66,
+        buying_power=196.66,
+        unrealized_pnl=-1.62,
+        realized_pnl=0.0,
+        positions=positions,
+        currency="CHF",
+    )
+
+    risk = portfolio.PortfolioRisk.from_snapshot(
+        snapshot,
+        portfolio.CashPolicy(risk_ceiling=0.40),
+    )
+
+    assert risk.cash == 196.66
+    assert risk.risk_capital == 394.13
+    assert round(risk.headroom(), 2) == -190.86
+
+
 def test_currency_mismatch_does_not_block_entry_guard(monkeypatch):
     import ib_core
     import portfolio

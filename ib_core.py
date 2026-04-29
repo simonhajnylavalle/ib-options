@@ -66,12 +66,47 @@ class OptionChain:
         self.exchange = exchange
         self.spot: Optional[float] = None
 
+    @staticmethod
+    def normalize_expiry(value: str) -> str:
+        """Normalize an expiry token to IB's YYYYMMDD format."""
+
+        raw = str(value).strip()
+        compact = raw.replace("-", "").replace("/", "")
+        if len(compact) != 8 or not compact.isdigit():
+            raise ValueError(f"Invalid expiry {value!r}; use YYYYMMDD or YYYY-MM-DD")
+        try:
+            datetime.strptime(compact, "%Y%m%d")
+        except ValueError as exc:
+            raise ValueError(f"Invalid expiry {value!r}; use a real calendar date") from exc
+        return compact
+
+    def _preferred_chain(self, stock: Stock):
+        chains = self._option_params(stock)
+        if not chains:
+            raise ValueError(f"No option chain found for {self.symbol}")
+        return next((c for c in chains if c.exchange == "SMART"), chains[0])
+
+    def available_expiries(self) -> pd.DataFrame:
+        """Return available expiries with DTE, without requesting option quotes."""
+
+        stock = self._stock_contract()
+        chain = self._preferred_chain(stock)
+        today = _market_date()
+        rows = []
+        for exp_str in sorted(chain.expirations):
+            exp_date = datetime.strptime(exp_str, "%Y%m%d").date()
+            dte = (exp_date - today).days
+            if dte >= 0:
+                rows.append({"expiry": exp_str, "dte": dte})
+        return pd.DataFrame(rows)
+
     def fetch(
         self,
         expiry_count: int = 5,
         strike_width: float = 0.3,
         batch_size: int = 50,
         rights: list[str] | None = None,
+        expiries: list[str] | None = None,
         dte_min: Optional[int] = None,
         dte_max: Optional[int] = None,
         spot_price: Optional[float] = None,
@@ -81,15 +116,24 @@ class OptionChain:
         """Return one row per qualified option contract."""
 
         stock = self._stock_contract()
-        chains = self._option_params(stock)
-        if not chains:
-            raise ValueError(f"No option chain found for {self.symbol}")
-
-        chain = next((c for c in chains if c.exchange == "SMART"), chains[0])
+        chain = self._preferred_chain(stock)
         all_expiries = sorted(chain.expirations)
 
         today = _market_date()
-        if dte_min is not None or dte_max is not None:
+        if expiries is not None:
+            available = set(all_expiries)
+            requested: list[str] = []
+            for value in expiries:
+                exp_str = self.normalize_expiry(value)
+                if exp_str not in requested:
+                    requested.append(exp_str)
+            missing = [exp for exp in requested if exp not in available]
+            if missing:
+                raise ValueError(
+                    f"Expiry not available for {self.symbol}: {', '.join(missing)}"
+                )
+            expiries = requested
+        elif dte_min is not None or dte_max is not None:
             expiries = []
             for exp_str in all_expiries:
                 dte = (datetime.strptime(exp_str, "%Y%m%d").date() - today).days
@@ -254,6 +298,7 @@ class OptionChain:
         dte_max: Optional[int] = None,
         strike_width: float = 0.25,
         expiry_count: int = 5,
+        expiries: list[str] | None = None,
         max_spread_pct: float = 15.0,
         min_open_interest: int = 50,
         min_volume: int = 5,
@@ -271,6 +316,7 @@ class OptionChain:
             dte_min=dte_min,
             dte_max=dte_max,
             expiry_count=expiry_count,
+            expiries=expiries,
             rights=rights,
             spot_price=spot_price,
             delta_min=delta_min,

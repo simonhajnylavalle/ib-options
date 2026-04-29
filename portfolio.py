@@ -67,15 +67,13 @@ class PortfolioRisk:
         if positions is None or positions.empty:
             spot_value = 0.0
             risk_capital = 0.0
-            signed_positions = 0.0
         else:
             spot_rows = _filter_sectype(positions, "STK")
             option_rows = _filter_sectype(positions, "OPT")
             spot_value = float(spot_rows["market_value"].fillna(0).sum())
             risk_capital = float(option_rows["market_value"].fillna(0).abs().sum())
-            signed_positions = float(positions["market_value"].fillna(0).sum())
 
-        cash = nav - signed_positions
+        cash = float(snapshot.cash)
         risk_pct = risk_capital / nav if nav else 0.0
         risk_status = "ABOVE_CEILING" if risk_pct > policy.risk_ceiling else "OK"
 

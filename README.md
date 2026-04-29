@@ -64,6 +64,73 @@ option-algorithm
 
 The app connects to IB using the host/port/client ID configured in `config.toml`, resolves the managed account, routes outbound orders to that account, loads any persisted plays, rebinds pending live entry/exit orders, runs an immediate strategy tick, and then continues on the configured risk loop interval. SNIPER scanning is throttled separately by `scanner_interval`, so exits can be monitored more frequently than new scanner entries.
 
+## Operator Console
+
+Order-submitting commands use an explicit confirmation flag by default. A first command prints a compact preview and does not submit; re-run with `--yes` to execute using fresh broker state and a fresh quote. For cancels, table row selectors are preview-only because live-order rows can change. The preview prints a stable `perm:` or `native:` confirmation command, optionally guarded by `conid:`.
+
+Useful command groups:
+
+```text
+orders | pending
+  Show live IB orders plus matched ENTRY/EXIT trackers.
+
+cancel row:<n>
+  Preview one live order cancel and print the stable confirmation command.
+
+cancel perm:<id> [conid:<con_id>] --yes
+  Cancel one live order and block automatic retry/resubmission.
+
+cancel perm:<id> --retry --yes
+cancel-retry native:<id> [conid:<con_id>] --yes
+  Cancel only this attempt and let the retry ladder continue.
+
+cancel-all [--yes]
+  Send IB global cancel and block working trackers.
+
+rebind
+  Re-run working entry/exit rebinding from live IB open orders.
+
+clear-working <play-row> entry|exit [--yes]
+  Clear a local blocked tracker only after a broad IB open-order query verifies no matching live order remains.
+```
+
+Scanner behavior is controlled separately:
+
+```toml
+[sniper.scanner]
+auto_open = false
+```
+
+With `auto_open = false`, `scan` reports hits only. Use `scan --open --yes` to submit a SNIPER entry from a scan hit.
+
+### Option chain research
+
+The console chain view is CALL-focused by default. The underlying `OptionChain`
+boundary still supports both option rights, but the operator-facing research
+command is intentionally kept on the call side until the strategy expands.
+
+```text
+chain <SYM>
+  Show CALL contracts using a ladder of expiries across roughly 21-180 DTE,
+  rather than only the nearest/front expiries.
+
+chain <SYM> expiries [p<N>]
+  List available expiries and DTEs without requesting option quotes.
+
+chain <SYM> dte=45-90
+chain <SYM> 45-90
+  Research calls in a specific DTE window.
+
+chain <SYM> exp=YYYYMMDD[,YYYYMMDD]
+  Research exact expiry dates.
+
+chain <SYM> front 4
+  Explicitly request the old nearest-expiry style.
+
+chain <SYM> thesis|approach|sentinel|sniper
+  Show contracts matching a play type's configured delta/DTE/liquidity shape.
+```
+
 ## Live Smoke Check
 
 ```bash

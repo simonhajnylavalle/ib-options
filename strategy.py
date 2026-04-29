@@ -558,6 +558,7 @@ class Strategy:
         sentinel_max_nav_pct: float = _DEFAULT_SENTINEL_MAX_NAV_PCT,
         sniper_max_nav_pct:   float = _DEFAULT_SNIPER_MAX_NAV_PCT,
         scanner_interval_secs: int  = 300,
+        scanner_auto_open:    bool  = True,
         pending_max_hours:    float = 24.0,
         entry_retry:          Optional[RetryProfile] = None,
         patient_retry:        Optional[RetryProfile] = None,
@@ -584,6 +585,7 @@ class Strategy:
         self.sentinel_max_nav_pct = sentinel_max_nav_pct
         self.sniper_max_nav_pct   = sniper_max_nav_pct
         self.scanner_interval_secs = max(1, int(scanner_interval_secs))
+        self.scanner_auto_open    = bool(scanner_auto_open)
         self._last_scan_at: Optional[datetime] = None
         self.pending_max_hours    = pending_max_hours
         self.entry_retry          = entry_retry or self._DEFAULT_ENTRY
@@ -974,7 +976,12 @@ class Strategy:
             hit = self.scanner.scan()
             if hit:
                 sym, spot = hit
-                if not self._has_open_play(sym, PlayType.SNIPER):
+                if not self.scanner_auto_open:
+                    print(
+                        f"[SCANNER] Auto-open disabled; use 'scan --open' or set "
+                        f"[sniper.scanner] auto_open=true to trade {sym}."
+                    )
+                elif not self._has_open_play(sym, PlayType.SNIPER):
                     self.open_sniper(sym, spot_price=spot, ctx=self.context())
 
     def _scanner_due(self) -> bool:
@@ -1375,6 +1382,166 @@ class Strategy:
                 )
             dirty = True
         return dirty
+
+    # ── operator recovery helpers ────────────────────────────────────────────
+
+    @staticmethod
+    def _order_field_int(order, name: str) -> Optional[int]:
+        try:
+            value = int(getattr(order, name, 0) or 0)
+        except (TypeError, ValueError):
+            return None
+        return value or None
+
+    def _recovery_live_trades(
+        self,
+        *,
+        con_id: int,
+        side: OrderSide,
+    ):
+        """Return the broadest open-order view available for recovery checks.
+
+        Recovery commands are fail-closed: if a broad IB open-order query fails,
+        the caller refuses to clear the local duplicate-order guard.  The
+        TypeError fallback exists only for broker-independent test doubles or
+        older executors that do not accept ``broad``.
+        """
+        try:
+            return self.executor.live_trades(con_id=con_id, side=side, broad=True)
+        except TypeError:
+            return self.executor.live_trades(con_id=con_id, side=side)
+        except Exception as exc:
+            raise RuntimeError(
+                "broad IB open-order verification failed; local tracker was not cleared"
+            ) from exc
+
+    def _matching_live_order_exists(
+        self,
+        play: Play,
+        tracker,
+        side: OrderSide,
+    ) -> bool:
+        """Conservative broker check used before clearing local trackers.
+
+        Any live order for the same contract, side and account is considered
+        matching. Strong IDs are checked first, but the fallback deliberately
+        refuses to clear when a plausible live order still exists; this keeps
+        duplicate-order protection fail-closed.
+        """
+        account_id = getattr(tracker, "account_id", None) or self.account.account_id or None
+        for trade in self._recovery_live_trades(con_id=play.con_id, side=side):
+            order = trade.order
+            order_account = getattr(order, "account", None)
+            if account_id and order_account and order_account != account_id:
+                continue
+            perm_id = self._order_field_int(order, "permId")
+            native_id = self._order_field_int(order, "orderId")
+            tracker_perm = getattr(tracker, "perm_id", None)
+            tracker_native = getattr(tracker, "native_order_id", None)
+            if tracker_perm and perm_id and int(tracker_perm) == int(perm_id):
+                return True
+            if tracker_native and native_id and int(tracker_native) == int(native_id):
+                return True
+            # Fallback: same contract + same side + compatible account is enough
+            # to refuse clearing, even if IDs are unavailable after restart.
+            return True
+        return False
+
+    def block_working_tracker_after_cancel(self, play: Play, kind: str) -> tuple[bool, str]:
+        """Mark a working tracker blocked after an operator cancellation.
+
+        This intentionally does not clear the tracker. It prevents the retry
+        ladder from immediately submitting a replacement order after the broker
+        cancel is sent. The operator can later run rebind/clear-working after
+        verifying live IB state.
+        """
+        kind = kind.lower()
+        tracker = play.working_entry if kind == "entry" else play.working_order if kind == "exit" else None
+        if tracker is None:
+            return False, f"play {play.play_id} has no working {kind} tracker"
+        tracker.cancel_requested = True
+        tracker.status = "EXHAUSTED"
+        tracker.trade_result = None
+        state.save(self.plays, account_id=self.account.account_id)
+        return True, f"{play.symbol} {kind} tracker blocked; use rebind or clear-working after broker verification"
+
+    def clear_working_entry_verified(
+        self,
+        play: Play,
+        ctx: Optional[StrategyContext] = None,
+    ) -> tuple[bool, str]:
+        """Clear a working entry only after verifying no matching live BUY remains."""
+        we = play.working_entry
+        if we is None:
+            return False, f"{play.symbol} has no working entry tracker"
+        try:
+            matching_live = self._matching_live_order_exists(play, we, OrderSide.BUY)
+        except RuntimeError as exc:
+            return False, f"refusing to clear {play.symbol} entry: {exc}"
+        if matching_live:
+            return False, (
+                f"refusing to clear {play.symbol} entry: matching live BUY order still exists at IB"
+            )
+
+        ctx = ctx or self.context()
+        pos_row = ctx.position(play.con_id)
+        live_qty = self._live_qty(pos_row)
+        if live_qty > 0:
+            avg_cost = float(pos_row.get("avg_cost", 0) or 0) if pos_row else 0.0
+            if avg_cost > 0:
+                play.entry_price = avg_cost / 100
+            play.qty_open = live_qty
+            play.qty_initial = max(play.qty_initial, live_qty)
+            play.status = PlayStatus.OPEN if live_qty >= play.qty_initial else PlayStatus.SCALING
+            msg = f"cleared entry tracker; reconciled live quantity to {live_qty}"
+        else:
+            play.qty_open = 0
+            if play.status == PlayStatus.PENDING:
+                play.qty_initial = 0
+            play.status = PlayStatus.CLOSED
+            msg = "cleared entry tracker; no live option position remains, play closed"
+
+        play.working_entry = None
+        state.save(self.plays, account_id=self.account.account_id)
+        return True, f"{play.symbol}: {msg}"
+
+    def clear_working_exit_verified(
+        self,
+        play: Play,
+        ctx: Optional[StrategyContext] = None,
+    ) -> tuple[bool, str]:
+        """Clear a working exit only after verifying no matching live SELL remains."""
+        wo = play.working_order
+        if wo is None:
+            return False, f"{play.symbol} has no working exit tracker"
+        try:
+            matching_live = self._matching_live_order_exists(play, wo, OrderSide.SELL)
+        except RuntimeError as exc:
+            return False, f"refusing to clear {play.symbol} exit: {exc}"
+        if matching_live:
+            return False, (
+                f"refusing to clear {play.symbol} exit: matching live SELL order still exists at IB"
+            )
+
+        old_qty = play.qty_open
+        ctx = ctx or self.context()
+        pos_row = ctx.position(play.con_id)
+        live_qty = self._live_qty(pos_row)
+        commit_reservations = bool(
+            live_qty < old_qty or live_qty <= 0 or getattr(wo, "accounted_fills", 0) > 0
+        )
+        if live_qty <= 0:
+            play.qty_open = 0
+            play.status = PlayStatus.CLOSED
+            msg = "cleared exit tracker; no live option position remains, play closed"
+        else:
+            play.qty_open = live_qty
+            play.status = PlayStatus.OPEN if live_qty >= play.qty_initial else PlayStatus.SCALING
+            msg = f"cleared exit tracker; reconciled live quantity to {live_qty}"
+
+        self._clear_working_order(play, commit_reservations=commit_reservations)
+        state.save(self.plays, account_id=self.account.account_id)
+        return True, f"{play.symbol}: {msg}"
 
     def _advance_working_entries(self, ctx: StrategyContext) -> bool:
         dirty = False
